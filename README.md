@@ -86,7 +86,11 @@ actually escape in practice.
   password, the decrypted plaintext, the parsed vault entries, the editor's
   input buffer, and the serialized blob. On exit the interactive editor also
   overwrites ratatui's render buffers so a *revealed* value doesn't linger in
-  freed terminal-cell memory.
+  freed terminal-cell memory. At startup the process also hardens itself against
+  a same-user attacker dumping its memory: on **Linux** it marks itself
+  **non-dumpable** (`prctl(PR_SET_DUMPABLE, 0)`), which blocks both core dumps
+  (e.g. via `kill -QUIT`) and `ptrace`/`/proc/<pid>/mem` access; on **macOS/BSD**
+  it disables core dumps (`RLIMIT_CORE = 0`). Windows has no equivalent step.
 
 ## Vaults are named
 
@@ -207,8 +211,14 @@ full `KEY=VALUE` line typed in one go (surrounding quotes are stripped).
   environment like any other variable; `envvault` only controls how it gets
   there, not what the program does with it afterward.
 - `envvault` protects secrets *at rest* and limits their *exposure at runtime*.
-  It cannot protect against an attacker who already runs code as your user (they
-  can read your memory or attach a debugger) or against root/malware.
+  Marking the process non-dumpable stops a *same-user* attacker from core-dumping
+  or debugging **the `envvault` process** to read its memory, but it does not make
+  the tool root-proof: root can read any process's memory, any file, and any TTY
+  regardless. A same-user attacker also retains other avenues it was never meant
+  to block — replacing the `envvault` binary, logging your keystrokes, or reading
+  a launched program's environment (`/proc/<pid>/environ`) once `run` hands it the
+  secrets. Defending against an attacker who already executes code in your
+  session is fundamentally beyond what any userspace tool can guarantee.
 - Memory zeroization is best-effort. Rust may move values before they are
   wiped, and while a value is *revealed* in the editor, transient per-frame
   copies inside the terminal library may be freed before being overwritten. The

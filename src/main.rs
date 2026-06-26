@@ -6,6 +6,7 @@
 //! (`$ENVVAULT_DIR`, else `<config-dir>/envvault`), one encrypted file each.
 
 mod crypto;
+mod harden;
 mod password;
 mod run;
 mod store;
@@ -88,6 +89,9 @@ enum Cmd {
 }
 
 fn main() {
+    // Mark the process non-dumpable before any secret or password can enter
+    // memory, so a same-uid attacker can't core-dump or ptrace it to read them.
+    harden::protect_process();
     if let Err(e) = run_cli() {
         eprintln!("error: {e:#}");
         std::process::exit(1);
