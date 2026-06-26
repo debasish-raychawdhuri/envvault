@@ -235,7 +235,9 @@ fn cmd_rm(name: &str, keys: &[String], password_stdin: bool) -> Result<()> {
 fn cmd_show(name: &str, password_stdin: bool) -> Result<()> {
     let path = resolve_existing(name)?;
     let (_session, vault) = open_vault(&path, password_stdin)?;
-    print!("{}", vault.serialize());
+    // `serialize()` returns a `Zeroizing<String>` (wiped on drop); deref to
+    // print its contents.
+    print!("{}", *vault.serialize());
     Ok(())
 }
 

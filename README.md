@@ -82,8 +82,11 @@ actually escape in practice.
   (`salt || nonce || ciphertext`). The file is plain UTF-8, so it survives
   copy-paste and is safe to commit to git or store in dotfiles.
 - **Hardening** — vault files are created `0600` and the vault directory `0700`
-  (owner-only). Key material and decrypted buffers are zeroized from memory when
-  dropped.
+  (owner-only). Sensitive memory is zeroized on drop: the derived key, the
+  password, the decrypted plaintext, the parsed vault entries, the editor's
+  input buffer, and the serialized blob. On exit the interactive editor also
+  overwrites ratatui's render buffers so a *revealed* value doesn't linger in
+  freed terminal-cell memory.
 
 ## Vaults are named
 
@@ -206,6 +209,11 @@ full `KEY=VALUE` line typed in one go (surrounding quotes are stripped).
 - `envvault` protects secrets *at rest* and limits their *exposure at runtime*.
   It cannot protect against an attacker who already runs code as your user (they
   can read your memory or attach a debugger) or against root/malware.
+- Memory zeroization is best-effort. Rust may move values before they are
+  wiped, and while a value is *revealed* in the editor, transient per-frame
+  copies inside the terminal library may be freed before being overwritten. The
+  guarantee is "no long-lived plaintext copies after exit," not "every byte
+  scrubbed at every instant."
 
 ## License
 

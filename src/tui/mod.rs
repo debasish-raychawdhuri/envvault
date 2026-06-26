@@ -18,7 +18,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use std::io::Stdout;
-use zeroize::Zeroizing;
 
 /// Open the interactive editor for `vault`, saving back through `session` to
 /// `path` when the user saves (`w`) or chooses save-on-quit.
@@ -31,8 +30,21 @@ pub fn run(session: &Session, path: &std::path::Path, vault: EnvVault) -> Result
         .to_string();
     let mut app = App::new(vault, label);
     let result = event_loop(&mut terminal, &mut app, session, path);
+    // Overwrite ratatui's render buffers before teardown so any revealed
+    // secret characters don't linger in the cell storage that is about to be
+    // freed. `app` (and its vault) zeroize their own copies on drop.
+    wipe_render_buffers(&mut terminal);
     restore_terminal(&mut terminal)?;
     result
+}
+
+/// Draw blank frames so the secret text in ratatui's internal `Buffer` cells
+/// is overwritten in place. Two passes cover both of the terminal's swap
+/// buffers (the current frame and the previously displayed one).
+fn wipe_render_buffers(terminal: &mut Tui) {
+    for _ in 0..2 {
+        let _ = terminal.draw(|f| f.render_widget(Clear, f.area()));
+    }
 }
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
@@ -114,7 +126,7 @@ fn event_loop(terminal: &mut Tui, app: &mut App, session: &Session, path: &std::
 /// Encrypt and persist; on failure show the error in the footer instead of
 /// tearing down the UI.
 fn save(app: &mut App, session: &Session, path: &std::path::Path) {
-    let data = Zeroizing::new(app.vault.serialize());
+    let data = app.vault.serialize();
     match session.save(path, data.as_bytes()) {
         Ok(()) => app.mark_saved(),
         Err(e) => app.status = format!("save failed: {e}"),

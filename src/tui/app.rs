@@ -2,6 +2,7 @@
 
 use crate::vault::{validate_key, EnvVault};
 use std::collections::HashSet;
+use zeroize::{Zeroize, Zeroizing};
 
 /// What the UI is currently doing. Determines which keys are handled and which
 /// overlay (if any) is drawn.
@@ -48,7 +49,9 @@ impl App {
             revealed: HashSet::new(),
             dirty: false,
             mode: Mode::Browse,
-            input: String::new(),
+            // Pre-allocate so typing a secret rarely reallocates (a realloc
+            // would leave an un-zeroized copy of the partial value behind).
+            input: String::with_capacity(256),
             pending_key: None,
             status: String::new(),
             should_quit: false,
@@ -57,6 +60,12 @@ impl App {
 
     fn set_status(&mut self, msg: impl Into<String>) {
         self.status = msg.into();
+    }
+
+    /// Empty the input buffer, wiping its contents from memory (unlike
+    /// `String::clear`, which leaves the bytes in the backing allocation).
+    fn clear_input(&mut self) {
+        self.input.zeroize();
     }
 
     pub fn is_revealed(&self, index: usize) -> bool {
@@ -91,7 +100,7 @@ impl App {
 
     pub fn begin_add(&mut self) {
         self.mode = Mode::AddKey;
-        self.input.clear();
+        self.clear_input();
         self.pending_key = None;
         self.set_status("");
     }
@@ -101,7 +110,12 @@ impl App {
             self.set_status("nothing to edit — press 'a' to add an entry");
             return;
         }
-        self.input = self.vault.entries()[self.selected].value.clone();
+        // Seed the editor with the current value without leaving an
+        // un-zeroized clone behind (plain `=` assignment would drop the old
+        // input buffer without wiping it).
+        self.clear_input();
+        let value = Zeroizing::new(self.vault.entries()[self.selected].value.clone());
+        self.input.push_str(&value);
         self.mode = Mode::EditValue;
         self.set_status("");
     }
@@ -139,6 +153,7 @@ impl App {
                 // Accept either a bare key name (then prompt for the value) or
                 // a full `KEY=VALUE` assignment typed in one go.
                 if let Some((key, value)) = crate::vault::split_assignment(&self.input) {
+                    let value = Zeroizing::new(value);
                     if let Err(e) = validate_key(&key) {
                         self.set_status(format!("invalid key: {e}"));
                         return;
@@ -147,7 +162,7 @@ impl App {
                     self.selected = idx;
                     self.dirty = true;
                     self.set_status(format!("added {key}"));
-                    self.input.clear();
+                    self.clear_input();
                     self.mode = Mode::Browse;
                     return;
                 }
@@ -160,7 +175,7 @@ impl App {
                     self.set_status(format!("'{key}' already exists — editing its value"));
                 }
                 self.pending_key = Some(key);
-                self.input.clear();
+                self.clear_input();
                 self.mode = Mode::AddValue;
             }
             Mode::AddValue => {
@@ -170,14 +185,14 @@ impl App {
                     self.dirty = true;
                     self.set_status(format!("added {key}"));
                 }
-                self.input.clear();
+                self.clear_input();
                 self.mode = Mode::Browse;
             }
             Mode::EditValue => {
                 self.vault.set_value_at(self.selected, &self.input);
                 self.dirty = true;
                 self.set_status("value updated");
-                self.input.clear();
+                self.clear_input();
                 self.mode = Mode::Browse;
             }
             _ => {}
@@ -185,7 +200,7 @@ impl App {
     }
 
     pub fn cancel_input(&mut self) {
-        self.input.clear();
+        self.clear_input();
         self.pending_key = None;
         self.mode = Mode::Browse;
         self.set_status("cancelled");
@@ -223,5 +238,17 @@ impl App {
 
     pub fn cancel_quit(&mut self) {
         self.mode = Mode::Browse;
+    }
+}
+
+impl Drop for App {
+    /// Wipe any secret material still held in the UI state when the editor
+    /// closes. (`vault` wipes itself via its own `ZeroizeOnDrop`.)
+    fn drop(&mut self) {
+        self.input.zeroize();
+        self.status.zeroize();
+        if let Some(k) = self.pending_key.as_mut() {
+            k.zeroize();
+        }
     }
 }

@@ -3,14 +3,17 @@
 //! text blob.
 
 use anyhow::{bail, Result};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-#[derive(Clone, Debug)]
+/// A single environment variable. The value (and key) are wiped from memory
+/// when the entry is dropped — on quit, on delete, or on Vec reallocation.
+#[derive(Clone, Debug, Zeroize, ZeroizeOnDrop)]
 pub struct Entry {
     pub key: String,
     pub value: String,
 }
 
-#[derive(Default)]
+#[derive(Default, Zeroize, ZeroizeOnDrop)]
 pub struct EnvVault {
     entries: Vec<Entry>,
 }
@@ -41,9 +44,10 @@ impl EnvVault {
     }
 
     /// Serialize back to a dotenv-style blob (one `KEY=VALUE` per line). Values
-    /// are quoted only when they would otherwise not round-trip cleanly.
-    pub fn serialize(&self) -> String {
-        let mut out = String::new();
+    /// are quoted only when they would otherwise not round-trip cleanly. The
+    /// result is `Zeroizing` so this plaintext blob is wiped when dropped.
+    pub fn serialize(&self) -> Zeroizing<String> {
+        let mut out = Zeroizing::new(String::new());
         for e in &self.entries {
             out.push_str(&e.key);
             out.push('=');
