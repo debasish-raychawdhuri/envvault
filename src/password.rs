@@ -26,6 +26,16 @@ pub fn prompt(prompt_text: &str) -> Result<Zeroizing<String>> {
     Ok(Zeroizing::new(pw))
 }
 
+/// Prompt for a secret value with no echo. Used by `set` so the value never
+/// appears in argv, shell history, or `/proc/<pid>/cmdline` the way a
+/// command-line argument would.
+pub fn prompt_value(key: &str) -> Result<Zeroizing<String>> {
+    require_tty()?;
+    let value = rpassword::prompt_password(format!("Value for {key}: "))
+        .context("failed to read value")?;
+    Ok(Zeroizing::new(value))
+}
+
 /// Prompt for a new password twice and require the two entries to match.
 pub fn prompt_new() -> Result<Zeroizing<String>> {
     require_tty()?;

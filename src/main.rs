@@ -60,14 +60,13 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true, num_args = 1..)]
         command: Vec<String>,
     },
-    /// Set one or more KEY=VALUE pairs non-interactively (scriptable).
+    /// Add or update one or more keys; prompts (no echo) for each value.
     Set {
         name: String,
-        /// Assignments like `OPENAI_API_KEY=sk-...` (repeatable).
+        /// Key names to set. The value for each is entered at a no-echo prompt,
+        /// so it never appears in argv, shell history, or /proc/<pid>/cmdline.
         #[arg(required = true, num_args = 1..)]
-        assignments: Vec<String>,
-        #[arg(long)]
-        password_stdin: bool,
+        keys: Vec<String>,
     },
     /// Remove one or more keys from a vault non-interactively.
     Rm {
@@ -114,11 +113,7 @@ fn run_cli() -> Result<()> {
             password_stdin,
             command,
         } => cmd_run(&name, password_stdin, &command),
-        Cmd::Set {
-            name,
-            assignments,
-            password_stdin,
-        } => cmd_set(&name, &assignments, password_stdin),
+        Cmd::Set { name, keys } => cmd_set(&name, &keys),
         Cmd::Rm {
             name,
             keys,
@@ -203,21 +198,23 @@ fn cmd_run(name: &str, password_stdin: bool, command: &[String]) -> Result<()> {
     run::run(&vault, program, args)
 }
 
-fn cmd_set(name: &str, assignments: &[String], password_stdin: bool) -> Result<()> {
+fn cmd_set(name: &str, keys: &[String]) -> Result<()> {
     let path = resolve_existing(name)?;
-    let (session, mut vault) = open_vault(&path, password_stdin)?;
-    for a in assignments {
-        let (key, value) = a
-            .split_once('=')
-            .with_context(|| format!("'{a}' is not in KEY=VALUE form"))?;
+    // Validate every key name before prompting, so a typo fails fast without
+    // asking for the vault password or any values.
+    for key in keys {
         vault::validate_key(key)?;
-        vault.set(key, value);
+    }
+    let (session, mut vault) = open_vault(&path, false)?;
+    for key in keys {
+        let value = password::prompt_value(key)?;
+        vault.set(key, &value);
     }
     session.save(&path, vault.serialize().as_bytes())?;
     println!(
         "Updated {} entr{}",
-        assignments.len(),
-        if assignments.len() == 1 { "y" } else { "ies" }
+        keys.len(),
+        if keys.len() == 1 { "y" } else { "ies" }
     );
     Ok(())
 }

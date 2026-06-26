@@ -155,8 +155,9 @@ envvault edit work
 envvault run work -- python train.py
 envvault run work -- bash -lc 'echo $OPENAI_API_KEY'
 
-# Set / update secrets non-interactively (scriptable)
-envvault set work OPENAI_API_KEY=sk-... DATABASE_URL=postgres://...
+# Add or update secrets — prompts (no echo) for each value, so the secret
+# never appears on the command line, in shell history, or in /proc/<pid>/cmdline
+envvault set work OPENAI_API_KEY DATABASE_URL
 
 # Remove keys
 envvault rm work DATABASE_URL
@@ -173,15 +174,16 @@ envvault show work
 | `list`                   | List all vaults in the vault directory. |
 | `edit <name>`            | Open the interactive TUI to manage secrets. |
 | `run <name> -- <cmd>…`   | Decrypt in memory and run `<cmd>` with the secrets in its environment. |
-| `set <name> KEY=VAL …`   | Add or update one or more entries non-interactively. |
+| `set <name> KEY …`       | Add/update keys; the value for each is entered at a no-echo prompt. |
 | `rm <name> KEY …`        | Remove one or more keys. |
 | `show <name>`            | Print decrypted `KEY=VALUE` lines to stdout. |
 
 By default you are prompted for the vault password with no echo. Add
 `--password-stdin` to any command to read the password from stdin instead — for
 automation, e.g. `echo "$PW" | envvault run work --password-stdin -- ./deploy`.
-(`--password-stdin` can't be combined with the interactive `edit` UI, which
-needs control of the terminal.)
+(`--password-stdin` isn't available on the interactive `edit` and `set`
+commands, which need the terminal to prompt you — `edit` for the UI and `set`
+for each value.)
 
 ### The interactive editor
 
