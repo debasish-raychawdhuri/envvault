@@ -131,7 +131,7 @@ fn draw(f: &mut Frame, app: &App) {
             Constraint::Min(1),    // list
             Constraint::Length(3), // footer
         ])
-        .split(f.size());
+        .split(f.area());
 
     draw_title(f, app, chunks[0]);
     draw_list(f, app, chunks[1]);
@@ -225,7 +225,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_input(f: &mut Frame, title: &str, value: &str) {
-    let area = centered_rect(60, 20, f.size());
+    let area = centered_rect(60, 20, f.area());
     f.render_widget(Clear, area);
     // Input is shown in plaintext while editing — you can't edit what you
     // can't see. Masking is only for the browse list.
@@ -241,7 +241,7 @@ fn draw_input(f: &mut Frame, title: &str, value: &str) {
 }
 
 fn draw_confirm(f: &mut Frame, message: &str) {
-    let area = centered_rect(60, 20, f.size());
+    let area = centered_rect(60, 20, f.area());
     f.render_widget(Clear, area);
     let p = Paragraph::new(message)
         .alignment(Alignment::Center)

@@ -33,8 +33,8 @@ rpassword = "7"
 zeroize = { version = "1", features = ["derive"] }
 
 # Terminal UI for the data-editing mode
-ratatui = "0.24"
-crossterm = "0.27"
+ratatui = "0.29"
+crossterm = "0.28"
 
 # Locating the per-user config directory
 dirs = "5"

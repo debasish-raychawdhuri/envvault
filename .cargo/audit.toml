@@ -1,0 +1,20 @@
+# cargo-audit configuration.
+#
+# These two advisories are informational warnings (not vulnerabilities) that
+# come transitively from `ratatui` (the TUI library) — even the latest ratatui
+# pulls them in, so they cannot be resolved by upgrading our dependencies.
+# Both are non-exploitable in envvault's usage; see the rationale on each.
+#
+# Re-evaluate whenever ratatui releases a version that drops these.
+
+[advisories]
+ignore = [
+    # `paste` (proc-macro) is unmaintained. Build-time only, generates no
+    # runtime code path we rely on; no known vulnerability.
+    "RUSTSEC-2024-0436",
+
+    # `lru` 0.12 has an unsound `IterMut` (Stacked Borrows violation). ratatui
+    # uses `lru` internally for its layout cache; envvault never calls the
+    # affected API. No data-corruption or memory-safety impact in our usage.
+    "RUSTSEC-2026-0002",
+]
