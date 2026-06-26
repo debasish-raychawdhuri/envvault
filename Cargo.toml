@@ -1,0 +1,42 @@
+[package]
+name = "envvault"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "envvault"
+path = "src/main.rs"
+
+[dependencies]
+# CLI
+clap = { version = "4.4", features = ["derive"] }
+anyhow = "1.0"
+
+# Password derivation (KDF) + authenticated encryption (AEAD)
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+
+# Randomness for salt + nonce
+getrandom = "0.2"
+
+# Text armoring of the encrypted blob
+base64 = "0.22"
+
+# Interactive password prompt (no echo)
+rpassword = "7"
+
+# Wipe secrets from memory when dropped
+zeroize = { version = "1", features = ["derive"] }
+
+# Terminal UI for the data-editing mode
+ratatui = "0.24"
+crossterm = "0.27"
+
+# Locating the per-user config directory
+dirs = "5"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
