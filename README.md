@@ -103,6 +103,79 @@ per-user directory:
   macOS.
 - Files are named `<name>.vault`.
 
+## How envvault compares — and why it exists
+
+There are many good tools for handling secrets. Most of them, though, are built
+for a *different* threat than the one a developer faces on their own laptop. The
+question that separates them is simple:
+
+> **When another program runs as *you* on your machine — a compromised npm/PyPI/
+> cargo dependency, a postinstall script, malware launched under your account —
+> can it walk away with your keys?**
+
+This is the realistic attacker for most people. It isn't root, and it isn't a
+remote intruder; it's code already executing at *your* privilege. The way most
+tools lose to it is the same every time: **they leave a persistent secret at
+rest that the attacker can simply read** — a plaintext file, a stored decryption
+key, or an always-unlocked keyring daemon.
+
+| Tool | How secrets sit at rest | What a process running as you can grab | Built for |
+|------|-------------------------|----------------------------------------|-----------|
+| plaintext `.env`, direnv | unencrypted on disk | the secrets, always — just read the file | convenience |
+| dotenvx | encrypted `.env` (safe to commit) | the **private-key file** (`.env.keys`), then every secret | keeping secrets out of git |
+| sops, age | encrypted file (age/PGP/KMS) | the decryption key (age/PGP keyfile or KMS creds), which usually sits in a local file or agent | teams, multi-recipient, many formats |
+| envchain, OS keyring (GNOME Keyring / KWallet) | encrypted by the login keyring | **every secret, once the keyring is unlocked** — the Secret Service has no per-application access control, and the login keyring auto-unlocks at login | desktop convenience |
+| Vault, Doppler, 1Password, Infisical, chamber | on a server / in the cloud | a token or session that fetches the secrets on demand | teams, infrastructure, audit |
+| **envvault** | encrypted file (Argon2id + ChaCha20-Poly1305) | **nothing at rest** — the passphrase lives only in your head and, briefly, in a non-dumpable process | a solo developer's local keys on a shared-uid machine |
+
+**Why envvault is built the way it is** — every design choice falls out of that
+one threat:
+
+- **No persistent unlock secret.** There is no stored key file and no
+  always-on, auto-unlocked daemon. You type the passphrase per use; it exists
+  only in your memory and transiently in the `envvault` process. A same-uid
+  attacker has nothing sitting on disk to read — they'd have to catch the
+  process *in the act*, keylog your typing, or replace the binary, all far
+  harder and noisier than reading a file. This is the core advantage over
+  dotenvx (a readable key file) and over the OS keyring (an unlocked daemon that
+  serves any caller).
+- **No plaintext on disk, ever — by construction.** The classic failure of
+  "encrypt a file" tools is the *orphaned plaintext*: you create a cleartext
+  file, encrypt it, and the original lingers — in the file you forgot to delete,
+  in editor swap/backup files, in the shell history of how you made it, in a
+  backup. envvault never creates that file. Secrets are entered directly into
+  the encrypted store through the TUI or the no-echo `set` prompt, so there is no
+  cleartext origin to leak. (This is also why `set` takes key *names*, never
+  `KEY=VALUE` on the command line — argv would land in shell history and
+  `/proc/<pid>/cmdline`.)
+- **Smallest possible runtime window.** When you `run` a program, the secret is
+  decrypted in memory and handed straight to that *one* child — never exported
+  into your shell, so nothing else inherits it. The process marks itself
+  non-dumpable so a same-uid attacker can't core-dump or `ptrace` it to scrape
+  the secret out of memory.
+- **No infrastructure.** One self-contained binary, one encrypted file per
+  vault. No server to run, no account to create, no cloud KMS, no key
+  distribution. Just a password and a file you can back up, sync, or even commit.
+
+**What envvault is *not* for** — being honest about the trade-offs:
+
+- **Teams.** A vault is locked by a single passphrase; there's no
+  multi-recipient encryption or shared access. For a team, sops (multi-key) or a
+  secret manager (Vault, Doppler, 1Password, Infisical) is the right tool.
+- **CI / fully unattended automation.** The strength here is that *you* hold the
+  passphrase. In CI you'd have to store it as a runner secret — at which point
+  it's a persistent secret like everyone else's, and the advantage narrows. Tools
+  designed around stored keys or fetch-tokens fit CI better.
+- **Defeating root.** No userspace tool can. Root reads any process's memory,
+  any file, and any TTY. envvault shrinks the exposure to same-privilege
+  attackers and to secrets at rest — see *Security notes & limitations* below.
+
+In short: **sops and dotenvx optimize for safely committing secrets to git;
+keyrings and cloud managers optimize for team convenience and infrastructure.
+envvault optimizes for the one program that needs a secret getting it, and
+nothing else on your machine — not your shell, not your history, not a leftover
+file, and not the next process that runs as you — ever does.**
+
 ---
 
 ## Install
