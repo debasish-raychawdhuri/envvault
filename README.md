@@ -119,6 +119,18 @@ tools lose to it is the same every time: **they leave a persistent secret at
 rest that the attacker can simply read** — a plaintext file, a stored decryption
 key, or an always-unlocked keyring daemon.
 
+**And the personal machine is where this bites hardest.** A server or CI runner
+is a controlled, boring place: a handful of vetted programs, installed on
+purpose, each doing one job. Your laptop is the opposite — hundreds of processes
+at any moment, and a constant churn of code you're just *trying out*: the latest
+npm or PyPI package, a CLI you found on GitHub, an editor extension, the newest
+game, a browser running untrusted JavaScript. Every one of them runs at your
+privilege, and any one of them can read a secret left sitting at rest. So the
+environment that holds your most personal, long-lived keys is also the one with
+the largest population of untrusted code able to take them — precisely where
+server- and team-oriented secret tooling offers the least protection. Closing
+that gap is the point of envvault.
+
 | Tool | How secrets sit at rest | What a process running as you can grab | Built for |
 |------|-------------------------|----------------------------------------|-----------|
 | plaintext `.env`, direnv | unencrypted on disk | the secrets, always — just read the file | convenience |
