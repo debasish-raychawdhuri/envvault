@@ -62,6 +62,25 @@ where
     )
 }
 
+/// Run `program args...` in a private mount namespace where each path in `hide`
+/// is masked by an empty overlay, so the command — and everything it spawns —
+/// cannot read those credentials. Everything else (home, env, agent sockets) is
+/// inherited unchanged, so the command otherwise runs as if on the host. Pure
+/// subtraction: the real files are never touched, and the namespace (with all
+/// overlays) is discarded on exit — there is nothing to restore. Linux-only.
+#[cfg(target_os = "linux")]
+pub fn unrun(program: &str, args: &[String], hide: &[std::path::PathBuf]) -> Result<()> {
+    linux::unrun(program, args, hide)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn unrun(_program: &str, _args: &[String], _hide: &[std::path::PathBuf]) -> Result<()> {
+    anyhow::bail!(
+        "`unrun` is only supported on Linux — it relies on unprivileged user + \
+         mount namespaces to hide credential paths from the command."
+    )
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
@@ -226,6 +245,78 @@ mod linux {
 
         // 9. Propagate the child's exit status. (Process exit tears down the
         //    namespace, unmounting and freeing the tmpfs automatically.)
+        match status.code() {
+            Some(0) => Ok(()),
+            Some(code) => std::process::exit(code),
+            None => std::process::exit(128 + status.signal().unwrap_or(0)),
+        }
+    }
+
+    /// Run `program` with every path in `hide` masked by an empty overlay, in a
+    /// private mount namespace. Inverse of `run`: it hides instead of reveals,
+    /// so there is no decrypt, no re-encrypt, and nothing to restore — the real
+    /// files are never touched and the namespace is discarded on exit.
+    pub fn unrun(program: &str, args: &[String], hide: &[PathBuf]) -> Result<()> {
+        // Capture real ids before unshare, then the same dance as `run`.
+        let euid = unsafe { libc::geteuid() };
+        let egid = unsafe { libc::getegid() };
+        set_dumpable(true);
+        let ns_setup = (|| -> Result<()> {
+            if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) } != 0 {
+                let err = std::io::Error::last_os_error();
+                if matches!(err.raw_os_error(), Some(libc::EPERM) | Some(libc::EACCES)) {
+                    return Err(userns_unavailable(&format!("unshare: {err}")));
+                }
+                return Err(
+                    anyhow::Error::new(err).context("unshare(CLONE_NEWUSER|CLONE_NEWNS) failed"),
+                );
+            }
+            configure_id_maps(euid, egid)
+        })();
+        set_dumpable(false);
+        ns_setup?;
+
+        mount_private_root()?;
+
+        // One empty file on a private tmpfs, used to mask regular files.
+        let scratch = scratch_dir("unrun")?;
+        mount_tmpfs(&scratch)?;
+        let empty = scratch.join("empty");
+        std::fs::write(&empty, b"")
+            .with_context(|| format!("failed to create {}", empty.display()))?;
+
+        // Mask each existing target with an empty overlay. `metadata` follows
+        // symlinks so we mask whatever the path resolves to; a missing or
+        // dangling path is already absent, so we skip it.
+        for path in hide {
+            match std::fs::metadata(path) {
+                Ok(m) if m.is_dir() => mount_tmpfs(path)?,
+                Ok(m) if m.is_file() => bind_file(&empty, path)?,
+                _ => continue, // missing, dangling, or a non-file/dir special — nothing to hide
+            }
+        }
+
+        // Spawn the child (it inherits the namespace and every overlay). Restore
+        // default signal handling in the child so Ctrl-C reaches it.
+        ignore_signals();
+        let mut cmd = Command::new(program);
+        cmd.args(args);
+        unsafe {
+            cmd.pre_exec(|| {
+                for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
+                    libc::signal(sig, libc::SIG_DFL);
+                }
+                Ok(())
+            });
+        }
+        let status = cmd
+            .spawn()
+            .with_context(|| format!("failed to execute '{program}'"))?
+            .wait()
+            .context("failed waiting for child process")?;
+
+        // Process exit tears down the namespace and all overlays automatically;
+        // the host is untouched. Just propagate the child's exit status.
         match status.code() {
             Some(0) => Ok(()),
             Some(code) => std::process::exit(code),

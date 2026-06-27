@@ -292,6 +292,11 @@ envvault rm work DATABASE_URL
 
 # Print decrypted contents to stdout (this exposes secrets!)
 envvault show work
+
+# Run an untrusted command with your credential files hidden from it (Linux):
+# ~/.ssh, ~/.aws, ~/.config/gh, … read as empty inside, the rest is unchanged
+envvault unrun -- npm install
+envvault unrun --hide ~/.config/some-tool -- ./suspicious-script
 ```
 
 ### Commands
@@ -304,6 +309,7 @@ envvault show work
 | `passwd <name>`          | Change the vault's password (verifies the old one, re-encrypts under the new). |
 | `upgrade <name>`         | Re-encrypt under the current Argon2id parameters (no-op if already current). |
 | `run <name> -- <cmd>…`   | Decrypt in memory and run `<cmd>` with the secrets in its environment. |
+| `unrun -- <cmd>…`        | Run `<cmd>` with your credential files **hidden** from it (Linux). `--hide <path>` adds more. |
 | `set <name> KEY …`       | Add/update keys; each value entered at a no-echo prompt, then the clipboard is wiped. |
 | `rename <old> <new>`     | Rename a vault. |
 | `rm <name> KEY …`        | Remove one or more keys. |
@@ -490,6 +496,55 @@ writing plaintext to real disk.
 | `dir upgrade <name>`           | Re-encrypt under the current Argon2id parameters (no-op if already current). |
 | `dir export <name> --to <dir>` | Decrypt the contents into `<dir>` (writes plaintext to disk!). |
 | `dir rm <name>`                | Delete the vault file. |
+
+---
+
+## `unrun`: run untested code blind to your credentials
+
+The vaults above protect the secrets envvault *manages*. But most credentials on
+a dev machine sit in plaintext files that no tool put in a vault — `~/.ssh`,
+`~/.aws/credentials`, `~/.config/gh`, `~/.npmrc`, and so on. When you let an AI
+coding agent (or any tool) run a command, that command and everything it spawns —
+a `postinstall` script, a fetched binary, a build step — runs as *you* and can
+read all of them.
+
+`unrun` runs a command in a private mount namespace where a curated set of
+credential paths is **masked** (each replaced by an empty overlay), so the
+command can't read them. It is the inverse of `dir run`: instead of *revealing*
+one decrypted secret, it *hides* many. Everything else — your home, caches,
+toolchains, environment, agent sockets — is left exactly as on the host, so the
+command otherwise runs normally.
+
+```sh
+envvault unrun -- npm install            # ~/.ssh, ~/.aws, … read as empty
+envvault unrun --hide ~/.config/foo -- ./script   # add your own path
+```
+
+It's **safe by construction**: a mount namespace is a copy-on-create, discard-on-
+exit view, so the real files are never moved or modified and there is nothing to
+restore — even if the command crashes. The masking is inherited by every child
+the command spawns.
+
+**Hidden by default** (`--hide <path>` adds more): `~/.ssh`, `~/.aws`,
+`~/.config/gh`, `~/.config/gcloud`, `~/.azure`, `~/.kube`, `~/.gnupg`,
+`~/.config/op`, `~/.terraform.d`, `~/.config/envvault`, `~/.npmrc`, `~/.pypirc`,
+`~/.netrc`, `~/.git-credentials`, `~/.docker/config.json`,
+`~/.cargo/credentials.toml`, `~/.databrickscfg`.
+
+**Limitations** — worth knowing, since this is a transparent denylist, not a
+deny-everything jail:
+
+- **It only hides what's on the list.** Anything not listed stays visible; the
+  default is curated but not exhaustive, so add your own with `--hide`.
+- **The environment and agent sockets are left native.** Secrets in environment
+  variables aren't masked, and `$SSH_AUTH_SOCK` / gpg-agent stay reachable — so
+  code can still *use* your SSH/GPG key via the agent (e.g. to sign or push), it
+  just can't *read the key bytes*. This is deliberate, so normal workflows keep
+  working.
+- **Writes to a masked path are ephemeral** — they land in the throwaway overlay
+  and vanish on exit; the real file is untouched.
+- **Linux only** (needs unprivileged user + mount namespaces); errors clearly
+  elsewhere, or if those namespaces are disabled.
 
 ## Security notes & limitations
 

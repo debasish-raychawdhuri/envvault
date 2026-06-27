@@ -92,6 +92,18 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true, num_args = 1..)]
         command: Vec<String>,
     },
+    /// Run a command with your credential files hidden, so untested code (e.g.
+    /// an AI agent's commands) can't read them. Hides a built-in set of secret
+    /// paths (~/.ssh, ~/.aws, ~/.config/gh, …); everything else is unchanged.
+    /// Linux only.
+    Unrun {
+        /// Extra path to hide, on top of the built-in credential list (repeatable).
+        #[arg(long)]
+        hide: Vec<String>,
+        /// The program to run, followed by its arguments (use `--` first).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true, num_args = 1..)]
+        command: Vec<String>,
+    },
     /// Add or update one or more keys; prompts (no echo) for each value.
     Set {
         name: String,
@@ -225,6 +237,7 @@ fn run_cli() -> Result<()> {
             harden,
             command,
         } => cmd_run(&name, password_stdin, quiet, harden, &command),
+        Cmd::Unrun { hide, command } => cmd_unrun(&hide, &command),
         Cmd::Set { name, keys } => cmd_set(&name, &keys),
         Cmd::Rm {
             name,
@@ -423,6 +436,45 @@ fn cmd_rename(old: &str, new: &str) -> Result<()> {
         .with_context(|| format!("failed to rename vault '{old}' to '{new}'"))?;
     println!("Renamed vault '{old}' to '{new}'");
     Ok(())
+}
+
+/// Built-in credential paths `unrun` hides, relative to $HOME. Whether each is a
+/// directory or a single file is detected at runtime. This is the credential-
+/// stealer target set; extend per-invocation with `--hide`.
+const UNRUN_DEFAULT_HIDE: &[&str] = &[
+    ".ssh",
+    ".aws",
+    ".config/gh",
+    ".config/gcloud",
+    ".azure",
+    ".kube",
+    ".gnupg",
+    ".config/op",
+    ".terraform.d",
+    ".config/envvault",
+    ".npmrc",
+    ".pypirc",
+    ".netrc",
+    ".git-credentials",
+    ".docker/config.json",
+    ".cargo/credentials.toml",
+    ".databrickscfg",
+];
+
+fn cmd_unrun(extra_hide: &[String], command: &[String]) -> Result<()> {
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        for rel in UNRUN_DEFAULT_HIDE {
+            paths.push(home.join(rel));
+        }
+    }
+    for p in extra_hide {
+        paths.push(std::path::PathBuf::from(p));
+    }
+    let (program, args) = command
+        .split_first()
+        .expect("clap guarantees at least one element");
+    sandbox::unrun(program, args, &paths)
 }
 
 fn cmd_run(
