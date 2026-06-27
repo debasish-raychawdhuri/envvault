@@ -36,6 +36,11 @@ zeroize = { version = "1", features = ["derive"] }
 ratatui = "0.29"
 crossterm = "0.28"
 
+# Clear the system clipboard after a secret is pasted into the editor.
+# default-features off avoids pulling the `image` crate (image clipboard);
+# `wayland-data-control` adds Wayland support alongside the X11 default.
+arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
+
 # Locating the per-user config directory
 dirs = "5"
 

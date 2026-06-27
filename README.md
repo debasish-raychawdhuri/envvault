@@ -276,6 +276,11 @@ In `envvault edit` / `envvault init`, values are **masked** by default. The
 "add" prompt accepts either a bare key name (it then asks for the value) or a
 full `KEY=VALUE` line typed in one go (surrounding quotes are stripped).
 
+**Paste clears the clipboard.** When you paste a value into an input field, the
+editor inserts it and then **wipes the system clipboard**, so the secret you
+copied (e.g. from a password manager) doesn't linger there for the next app to
+read. See the caveat about clipboard managers under *Security notes* below.
+
 | Key | Action |
 |-----|--------|
 | `↑`/`↓`, `j`/`k` | move the selection |
@@ -311,6 +316,13 @@ full `KEY=VALUE` line typed in one go (surrounding quotes are stripped).
   copies inside the terminal library may be freed before being overwritten. The
   guarantee is "no long-lived plaintext copies after exit," not "every byte
   scrubbed at every instant."
+- Clearing the clipboard on paste is best-effort. A **clipboard manager**
+  (KDE Klipper, GPaste, GNOME's clipboard history, etc.) may have already
+  captured the secret when you *copied* it, and some are configured to restore
+  the previous entry when the clipboard is emptied — which can undo the wipe.
+  envvault clears the live clipboard; it cannot reach into a manager's history.
+  If no clipboard is reachable (e.g. over SSH without a display) the paste still
+  works but can't be wiped, and the editor says so.
 
 ## License
 

@@ -210,6 +210,21 @@ impl App {
         self.input.push(c);
     }
 
+    /// Insert pasted text into the active input buffer. Newlines and carriage
+    /// returns are dropped so a multi-line paste can't break the single-line
+    /// vault format (or smuggle past the Enter handler). Returns true if the
+    /// paste landed in an input field, so the caller knows to wipe the
+    /// clipboard.
+    pub fn paste(&mut self, text: &str) -> bool {
+        if !matches!(self.mode, Mode::AddKey | Mode::AddValue | Mode::EditValue) {
+            return false;
+        }
+        for c in text.chars().filter(|&c| c != '\n' && c != '\r') {
+            self.input.push(c);
+        }
+        true
+    }
+
     pub fn backspace(&mut self) {
         self.input.pop();
     }

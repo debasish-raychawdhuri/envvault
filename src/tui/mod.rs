@@ -6,7 +6,9 @@ use crate::crypto::Session;
 use crate::vault::EnvVault;
 use anyhow::{Context, Result};
 use app::{App, Mode};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -52,7 +54,11 @@ type Tui = Terminal<CrosstermBackend<Stdout>>;
 fn setup_terminal() -> Result<Tui> {
     enable_raw_mode().context("failed to enable raw mode")?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
+    // Bracketed paste makes the terminal wrap pasted text so it arrives as a
+    // single `Event::Paste` we can distinguish from typing — needed so we can
+    // wipe the clipboard after a secret is pasted.
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)
+        .context("failed to enter alternate screen")?;
     let terminal = Terminal::new(CrosstermBackend::new(stdout))
         .context("failed to initialize terminal")?;
     Ok(terminal)
@@ -60,16 +66,27 @@ fn setup_terminal() -> Result<Tui> {
 
 fn restore_terminal(terminal: &mut Tui) -> Result<()> {
     disable_raw_mode().ok();
-    execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableBracketedPaste).ok();
     terminal.show_cursor().ok();
     Ok(())
 }
 
 fn event_loop(terminal: &mut Tui, app: &mut App, session: &Session, path: &std::path::Path) -> Result<()> {
+    // Held for the whole session so a cleared (empty) clipboard keeps being
+    // served on X11, where the setting process must stay alive to serve the
+    // selection. `None` if no clipboard is reachable (e.g. headless / SSH
+    // without a display) — pasting still works, we just can't wipe it.
+    let mut clipboard = arboard::Clipboard::new().ok();
+
     loop {
         terminal.draw(|f| draw(f, app))?;
 
-        let Event::Key(key) = event::read()? else {
+        let ev = event::read()?;
+        if let Event::Paste(text) = &ev {
+            handle_paste(app, &mut clipboard, text);
+            continue;
+        }
+        let Event::Key(key) = ev else {
             continue;
         };
         if key.kind != KeyEventKind::Press {
@@ -121,6 +138,21 @@ fn event_loop(terminal: &mut Tui, app: &mut App, session: &Session, path: &std::
         }
     }
     Ok(())
+}
+
+/// Insert pasted text into the active input field and, if it landed there,
+/// wipe the system clipboard so the pasted secret doesn't linger in it.
+fn handle_paste(app: &mut App, clipboard: &mut Option<arboard::Clipboard>, text: &str) {
+    if !app.paste(text) {
+        return; // not in an input field — nothing was entered, leave clipboard alone
+    }
+    app.status = match clipboard.as_mut() {
+        Some(cb) => match cb.clear() {
+            Ok(()) => "pasted — clipboard cleared".to_string(),
+            Err(e) => format!("pasted — could not clear clipboard: {e}"),
+        },
+        None => "pasted — clipboard unavailable to clear".to_string(),
+    };
 }
 
 /// Encrypt and persist; on failure show the error in the footer instead of
