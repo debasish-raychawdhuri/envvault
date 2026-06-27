@@ -119,6 +119,21 @@ tools lose to it is the same every time: **they leave a persistent secret at
 rest that the attacker can simply read** — a plaintext file, a stored decryption
 key, or an always-unlocked keyring daemon.
 
+**This is the modern playbook, not a hypothetical.** The defining trait of
+recent supply-chain attacks is that they exploit *no vulnerability on your
+machine* — their code runs as you during an install, and the payload simply
+**reads known credential paths and exfiltrates them**. The Codecov breach (2021)
+shipped a tampered uploader that exfiltrated environment variables — and the CI
+secrets in them. Waves of hijacked npm and PyPI packages have carried
+credential-stealers that scan for and upload tokens, SSH keys, and cloud
+credentials. The 2025 npm worm *Shai-Hulud* automated the whole loop: on install
+it scanned the host for secrets and used the tokens it harvested to republish
+itself into more packages. The job is always the same cheap one — get code
+running as you, then read `~/.ssh`, `~/.aws/credentials`, `~/.npmrc`,
+`~/.config/gh`, and the environment. envvault's bet is to make those reads come
+up empty: an env-vault never exports into your shell, and a directory vault
+leaves only an encrypted blob and an empty directory.
+
 **And the personal machine is where this bites hardest.** A server or CI runner
 is a controlled, boring place: a handful of vetted programs, installed on
 purpose, each doing one job. Your laptop is the opposite — hundreds of processes
