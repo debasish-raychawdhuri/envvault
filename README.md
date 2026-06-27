@@ -81,6 +81,14 @@ actually escape in practice.
 - **On-disk format** — a short text header plus a base64 body
   (`salt || nonce || ciphertext`). The file is plain UTF-8, so it survives
   copy-paste and is safe to commit to git or store in dotfiles.
+- **Durable writes** — every save is journaled. The new ciphertext is written
+  to a temp file, fsynced, **decrypted and verified** against what it should
+  contain, and only then atomically renamed over the old vault (with the
+  directory fsynced so the rename itself survives a power loss). A failed,
+  corrupted, or interrupted write leaves the previous vault completely intact
+  rather than truncating it — so a crash mid-re-encryption can never lose your
+  secrets. The same path is used for env-var saves, the on-exit re-encrypt of a
+  directory vault, and every debounced autosave during a `dir run`.
 - **Hardening** — vault files are created `0600` and the vault directory `0700`
   (owner-only). Sensitive memory is zeroized on drop: the derived key, the
   password, the decrypted plaintext, the parsed vault entries, the editor's
@@ -348,10 +356,14 @@ runs your program (which sees a normal, populated `~/.claude`), and re-encrypts
 from the tmpfs when the program exits. The tmpfs is **visible only to that
 program and its children** — it never appears in the host mount namespace, so
 every other process (even same-uid ones) sees only the empty real directory, and
-it vanishes when the program exits. For a **single-file vault** it instead
-decrypts the file onto a private tmpfs and **bind-mounts that one file** over its
-real path, leaving the rest of the directory real and on disk — so a live
-database sitting next to the secret keeps working normally. No root is needed, as
+it vanishes when the program exits. For a **single-file vault** it mounts a
+tmpfs over the file's **parent directory**, **binds every real sibling back in**
+(so a live database or cache next to the secret keeps reading and writing real
+disk), and drops the decrypted file into that tmpfs as an ordinary file — leaving
+the rest of the directory real and on disk. Virtualizing at directory
+granularity means a program can rewrite the secret *in place* **or** replace it
+atomically (the write-temp-then-`rename` pattern many tools and editors use)
+entirely in RAM, and the change is still captured on exit. No root is needed, as
 long as unprivileged user namespaces are enabled (the default on most desktop
 distros). If they're disabled, `dir run` fails with a clear message rather than
 writing plaintext to real disk.
@@ -394,12 +406,15 @@ writing plaintext to real disk.
   scrubbed at every instant."
 - **Directory vaults** (`dir run`) are Linux-only — they rely on unprivileged
   user + mount namespaces. `dir init`/`dir export`/`dir list` work everywhere.
-- A **single-file vault** virtualizes only that one file (bind-mounted from RAM);
-  everything else in its directory stays real on disk. This is clean for files
-  read at startup or written *in place* (the common case, including static API
-  keys). A file rewritten via atomic-rename *during* a session (e.g. some OAuth
-  token-refresh flows) isn't captured by the bind — a flagged limitation, not a
-  silent one.
+- A **single-file vault** mounts a tmpfs over the file's *parent directory* and
+  binds the real siblings back, so only the vaulted file lives in RAM while
+  everything else in the directory stays real on disk. Because the file sits in a
+  tmpfs directory (rather than being bind-mounted in place), a program can rewrite
+  it *in place* **or** via atomic-rename (an OAuth token-refresh, an editor's
+  write-temp-then-rename) and the change is captured. The one limitation: sibling
+  files *created* during a session land in the tmpfs and do **not** persist after
+  exit — siblings that already existed when the vault was opened do persist. A
+  flagged limitation, not a silent one.
 - `dir init` **deletes** the original files but does not *securely shred* them:
   the plaintext that was already on disk before you vaulted it may remain
   recoverable from free space until overwritten (especially on SSDs/CoW

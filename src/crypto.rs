@@ -72,10 +72,47 @@ impl Session {
         Ok(format!("{MAGIC}\n{}\n", B64.encode(&blob)))
     }
 
-    /// Encrypt and atomically write the vault to `path` with 0600 permissions.
+    /// Encrypt and durably write the vault to `path` with 0600 permissions.
+    ///
+    /// This is a journaling write: the ciphertext is written to a temp file,
+    /// fsynced, **decrypted and compared back against `plaintext`**, and only
+    /// then atomically renamed over `path` (with the directory fsynced so the
+    /// rename survives power loss). If anything fails before the rename, the
+    /// previous vault file is left completely untouched and the temp file is
+    /// removed — so a torn write, a storage fault, or an encryption bug can
+    /// never destroy the only good copy of your secrets.
     pub fn save(&self, path: &Path, plaintext: &[u8]) -> Result<()> {
         let armored = self.armor(plaintext)?;
-        write_private(path, armored.as_bytes())
+        write_private(path, armored.as_bytes(), |tmp| {
+            let got = self.decrypt_file(tmp).context(
+                "post-write verification: could not decrypt the file just written",
+            )?;
+            if got.as_slice() != plaintext {
+                bail!(
+                    "post-write verification failed: the decrypted contents of the \
+                     newly written file differ from what was encrypted"
+                );
+            }
+            Ok(())
+        })
+    }
+
+    /// Decrypt a vault file using *this* session's key (no password re-prompt).
+    /// Used to verify a freshly written file before committing it. The salt
+    /// stored in the file must match the session's, or the file isn't ours.
+    fn decrypt_file(&self, path: &Path) -> Result<Zeroizing<Vec<u8>>> {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to re-read {} for verification", path.display()))?;
+        let (salt, nonce, ciphertext) = parse_armored(&text, &path.display().to_string())?;
+        if salt != self.salt {
+            bail!("verification: the file just written has an unexpected salt");
+        }
+        let cipher = ChaCha20Poly1305::new_from_slice(self.key.as_ref())
+            .map_err(|e| anyhow!("invalid key length: {e}"))?;
+        let plaintext = cipher
+            .decrypt(Nonce::from_slice(&nonce), ciphertext.as_ref())
+            .map_err(|_| anyhow!("verification: could not decrypt the file just written"))?;
+        Ok(Zeroizing::new(plaintext))
     }
 }
 
@@ -84,11 +121,25 @@ impl Session {
 pub fn open(path: &Path, password: &[u8]) -> Result<(Session, Zeroizing<Vec<u8>>)> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read vault at {}", path.display()))?;
+    let (salt, nonce, ciphertext) = parse_armored(&text, &path.display().to_string())?;
 
+    let key = derive_key(password, &salt)?;
+    let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref())
+        .map_err(|e| anyhow!("invalid key length: {e}"))?;
+    let plaintext = cipher
+        .decrypt(Nonce::from_slice(&nonce), ciphertext.as_ref())
+        .map_err(|_| anyhow!("decryption failed — wrong password or corrupted file"))?;
+
+    Ok((Session { salt, key }, Zeroizing::new(plaintext)))
+}
+
+/// Parse an armored vault body into its `(salt, nonce, ciphertext)` parts.
+/// `src` names the source (a path) for error messages.
+fn parse_armored(text: &str, src: &str) -> Result<([u8; SALT_LEN], [u8; NONCE_LEN], Vec<u8>)> {
     let mut lines = text.lines();
     let header = lines.next().unwrap_or("").trim();
     if header != MAGIC {
-        bail!("{} is not an envvault file (bad header)", path.display());
+        bail!("{src} is not an envvault file (bad header)");
     }
     let b64: String = lines.collect::<Vec<_>>().join("");
     let blob = B64
@@ -99,17 +150,9 @@ pub fn open(path: &Path, password: &[u8]) -> Result<(Session, Zeroizing<Vec<u8>>
         bail!("vault file is truncated or corrupted");
     }
     let salt: [u8; SALT_LEN] = blob[..SALT_LEN].try_into().unwrap();
-    let nonce = &blob[SALT_LEN..SALT_LEN + NONCE_LEN];
-    let ciphertext = &blob[SALT_LEN + NONCE_LEN..];
-
-    let key = derive_key(password, &salt)?;
-    let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref())
-        .map_err(|e| anyhow!("invalid key length: {e}"))?;
-    let plaintext = cipher
-        .decrypt(Nonce::from_slice(nonce), ciphertext)
-        .map_err(|_| anyhow!("decryption failed — wrong password or corrupted file"))?;
-
-    Ok((Session { salt, key }, Zeroizing::new(plaintext)))
+    let nonce: [u8; NONCE_LEN] = blob[SALT_LEN..SALT_LEN + NONCE_LEN].try_into().unwrap();
+    let ciphertext = blob[SALT_LEN + NONCE_LEN..].to_vec();
+    Ok((salt, nonce, ciphertext))
 }
 
 #[cfg(test)]
@@ -166,6 +209,56 @@ mod tests {
     }
 
     #[test]
+    fn save_leaves_no_temp_litter_and_overwrites_atomically() {
+        let dir = std::env::temp_dir().join("envvault-test-litter");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("v.vault");
+
+        let session = Session::create(b"pw").unwrap();
+        session.save(&path, b"K=1\n").unwrap();
+        // Re-save over the existing vault (the autosave / re-encrypt case).
+        session.save(&path, b"K=2\n").unwrap();
+
+        // The new contents are present...
+        let (_s, pt) = open(&path, b"pw").unwrap();
+        assert_eq!(&pt[..], b"K=2\n");
+
+        // ...and no temp file was left behind in the directory.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "stray temp files: {leftovers:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_verifies_before_commit() {
+        // A save must round-trip under this session's own key; decrypt_file is
+        // the verification gate write_private runs before renaming into place.
+        let dir = std::env::temp_dir().join("envvault-test-verify");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("v.vault");
+
+        let session = Session::create(b"pw").unwrap();
+        session.save(&path, b"SECRET=v\n").unwrap();
+        let got = session.decrypt_file(&path).unwrap();
+        assert_eq!(&got[..], b"SECRET=v\n");
+
+        // A file written under a *different* session's key must not verify as
+        // this session's, guarding the "is this file really ours" check.
+        let other = Session::create(b"pw").unwrap(); // fresh salt => different key
+        assert!(other.decrypt_file(&path).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn tampered_ciphertext_fails() {
         let session = Session::create(b"pw").unwrap();
         let armored = session.armor(b"K=v\n").unwrap();
@@ -185,21 +278,58 @@ mod tests {
     }
 }
 
-/// Write bytes to `path`, creating it with owner-only (0600) permissions on
-/// unix, via a temp file + rename so we never leave a partial file behind.
-fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+/// Removes a temp file on drop unless disarmed — so a failed write or a failed
+/// verification never leaves a stray partial file behind.
+struct TmpGuard {
+    path: std::path::PathBuf,
+    armed: bool,
+}
+
+impl TmpGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TmpGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Durably write `bytes` to `path` with owner-only (0600) permissions, as a
+/// journaling write:
+///
+/// 1. write the bytes to a per-process temp file in the same directory,
+/// 2. `fsync` the temp file's data,
+/// 3. call `verify(tmp)` — a chance to confirm the bytes round-trip *before*
+///    we touch the existing file (we never destroy the only good copy),
+/// 4. atomically `rename` the temp over `path`, then
+/// 5. `fsync` the directory so the rename itself survives a power loss.
+///
+/// On any failure before step 4 the previous file is untouched and the temp is
+/// removed. Same-directory temp guarantees the rename is atomic (same fs).
+fn write_private(
+    path: &Path,
+    bytes: &[u8],
+    verify: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
     use std::io::Write;
 
-    let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
-    let tmp = match dir {
-        Some(d) => d.join(format!(
-            ".{}.tmp",
-            path.file_name().and_then(|n| n.to_str()).unwrap_or("vault")
-        )),
-        None => std::path::PathBuf::from(format!(
-            ".{}.tmp",
-            path.file_name().and_then(|n| n.to_str()).unwrap_or("vault")
-        )),
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let stem = path.file_name().and_then(|n| n.to_str()).unwrap_or("vault");
+    // Per-process temp name so two writers (or a stale crash leftover) can't
+    // clobber each other's in-flight file.
+    let tmp_name = format!(".{stem}.{}.tmp", std::process::id());
+    let tmp = match parent {
+        Some(d) => d.join(&tmp_name),
+        None => std::path::PathBuf::from(&tmp_name),
+    };
+    let mut guard = TmpGuard {
+        path: tmp.clone(),
+        armed: true,
     };
 
     let mut opts = std::fs::OpenOptions::new();
@@ -217,7 +347,20 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
         .with_context(|| format!("failed to write {}", tmp.display()))?;
     drop(f);
 
+    // Confirm the new file is good *before* replacing the old one.
+    verify(&tmp).context("refusing to commit: the newly written vault file did not verify")?;
+
     std::fs::rename(&tmp, path)
         .with_context(|| format!("failed to move temp file into place at {}", path.display()))?;
+    guard.disarm(); // the temp no longer exists under its old name
+
+    // Make the rename durable: without fsyncing the directory, a crash right
+    // after the rename can lose the new directory entry. Best-effort — the data
+    // is already safely in place, so a dir-fsync failure shouldn't fail the save.
+    if let Some(dir) = parent
+        && let Ok(df) = std::fs::File::open(dir)
+    {
+        let _ = df.sync_all();
+    }
     Ok(())
 }

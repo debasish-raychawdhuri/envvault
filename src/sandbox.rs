@@ -140,25 +140,37 @@ mod linux {
                     .context("failed to populate the in-memory directory")?;
             }
             Kind::File => {
-                // Keep the rest of the directory real on disk; only the single
-                // file is virtualized. Decrypt it onto a private tmpfs and
-                // bind-mount that RAM file over the real (placeholder) path.
-                if let Some(parent) = target.parent() {
-                    std::fs::create_dir_all(parent)
-                        .with_context(|| format!("failed to create {}", parent.display()))?;
-                }
-                if !target.exists() {
-                    std::fs::write(&target, b"").with_context(|| {
-                        format!("failed to create placeholder {}", target.display())
-                    })?;
-                }
-                let scratch = scratch_mount_dir()?;
-                mount_tmpfs(&scratch)?;
-                dirvault
-                    .extract_into(&scratch)
-                    .context("failed to populate the in-memory file")?;
+                // Virtualize at *directory* granularity so the app can atomically
+                // rename-replace the secret file in RAM (you cannot rename over a
+                // bind-mounted single file — the kernel returns EBUSY, or the new
+                // file lands on real disk and is lost). We tmpfs the parent, bind
+                // the real siblings (e.g. a live DB) back so their writes persist,
+                // and drop the decrypted secret in as an ordinary tmpfs file.
+                let parent = target
+                    .parent()
+                    .context("vaulted file has no parent directory")?;
                 let basename = target.file_name().context("vaulted file has no file name")?;
-                bind_file(&scratch.join(basename), &target)?;
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create {}", parent.display()))?;
+
+                // 1. Bind the real parent to a private stash so we can still
+                //    reach the real siblings after tmpfs covers the parent.
+                let stash = scratch_dir("stash")?;
+                bind_dir(parent, &stash)?;
+
+                // 2. tmpfs over the parent: a writable RAM directory at the real
+                //    path. The real contents stay live, only via `stash`.
+                mount_tmpfs(parent)?;
+
+                // 3. Bind every real sibling (all but the vaulted file) back in,
+                //    so persistent files keep living on real disk.
+                rebind_siblings(&stash, parent, basename)?;
+
+                // 4. Decrypt the secret into the tmpfs parent as an ordinary file
+                //    (not a bind) so rename-replace happens entirely in RAM.
+                dirvault
+                    .extract_into(parent)
+                    .context("failed to populate the in-memory file")?;
             }
         }
 
@@ -292,29 +304,82 @@ mod linux {
         }
     }
 
-    /// A fresh private mountpoint for a file-vault tmpfs. Lives under
-    /// `$XDG_RUNTIME_DIR` (already tmpfs, cleaned at logout) or the temp dir.
-    fn scratch_mount_dir() -> Result<PathBuf> {
+    /// A fresh private scratch directory under `$XDG_RUNTIME_DIR` (already tmpfs,
+    /// cleaned at logout) or the temp dir, tagged for its role and the pid.
+    fn scratch_dir(tag: &str) -> Result<PathBuf> {
         let base = std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
-        let dir = base.join(format!(".envvault-mnt-{}", std::process::id()));
+        let dir = base.join(format!(".envvault-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir)
-            .with_context(|| format!("failed to create scratch mountpoint {}", dir.display()))?;
+            .with_context(|| format!("failed to create scratch dir {}", dir.display()))?;
         Ok(dir)
     }
 
     /// `mount(src, target, NULL, MS_BIND, NULL)` — splice the file at `src` in
     /// at `target` (both must already exist).
     fn bind_file(src: &Path, target: &Path) -> Result<()> {
+        bind(src, target, libc::MS_BIND)
+    }
+
+    /// Recursively bind-mount the directory `src` at `target` (carrying any
+    /// submounts along), so the real directory's contents appear at `target`.
+    fn bind_dir(src: &Path, target: &Path) -> Result<()> {
+        bind(src, target, libc::MS_BIND | libc::MS_REC)
+    }
+
+    /// Shared bind-mount helper. `src` and `target` must both already exist and
+    /// be of matching type (file→file, dir→dir).
+    fn bind(src: &Path, target: &Path, flags: libc::c_ulong) -> Result<()> {
         let s = CString::new(src.as_os_str().as_bytes()).context("source path has a NUL byte")?;
         let t = CString::new(target.as_os_str().as_bytes()).context("target path has a NUL byte")?;
-        let rc = unsafe {
-            libc::mount(s.as_ptr(), t.as_ptr(), ptr::null(), libc::MS_BIND, ptr::null())
-        };
+        let rc =
+            unsafe { libc::mount(s.as_ptr(), t.as_ptr(), ptr::null(), flags, ptr::null()) };
         if rc != 0 {
             return Err(std::io::Error::last_os_error())
                 .with_context(|| format!("failed to bind-mount onto {}", target.display()));
+        }
+        Ok(())
+    }
+
+    /// For a single-file vault: re-expose every real sibling of the vaulted file
+    /// inside the tmpfs `parent`, so persistent neighbours (a live database, a
+    /// cache) keep reading and writing real disk. `stash` is a bind of the real
+    /// parent (made before the tmpfs went on); `exclude` is the vaulted file's
+    /// own name, which we leave out so the decrypted copy can own that path.
+    ///
+    /// Directories and regular files are bind-mounted back (so their data and
+    /// writes stay on real disk); symlinks are recreated in the tmpfs (binding
+    /// through a symlink is fragile). Siblings *created* later land in the tmpfs
+    /// and do not persist — a documented limitation of single-file vaults.
+    fn rebind_siblings(stash: &Path, parent: &Path, exclude: &std::ffi::OsStr) -> Result<()> {
+        for entry in std::fs::read_dir(stash)
+            .with_context(|| format!("failed to read stashed dir {}", stash.display()))?
+        {
+            let entry = entry?;
+            let name = entry.file_name();
+            if name == exclude {
+                continue;
+            }
+            let src = stash.join(&name);
+            let dst = parent.join(&name);
+            let ft = entry.file_type().with_context(|| {
+                format!("failed to stat sibling {}", src.display())
+            })?;
+            if ft.is_symlink() {
+                let link_target = std::fs::read_link(&src)
+                    .with_context(|| format!("failed to read symlink {}", src.display()))?;
+                std::os::unix::fs::symlink(&link_target, &dst)
+                    .with_context(|| format!("failed to recreate symlink {}", dst.display()))?;
+            } else if ft.is_dir() {
+                std::fs::create_dir_all(&dst)
+                    .with_context(|| format!("failed to create mountpoint {}", dst.display()))?;
+                bind_dir(&src, &dst)?;
+            } else {
+                std::fs::write(&dst, b"")
+                    .with_context(|| format!("failed to create mountpoint {}", dst.display()))?;
+                bind_file(&src, &dst)?;
+            }
         }
         Ok(())
     }
