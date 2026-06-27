@@ -29,6 +29,10 @@ base64 = "0.22"
 # Interactive password prompt (no echo)
 rpassword = "7"
 
+# Password-strength estimation (dictionary/pattern aware) shown when a vault
+# password is created or changed.
+zxcvbn = "3"
+
 # Wipe secrets from memory when dropped
 zeroize = { version = "1", features = ["derive"] }
 

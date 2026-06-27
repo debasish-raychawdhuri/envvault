@@ -300,7 +300,10 @@ read. See the caveat about clipboard managers under *Security notes* below.
 ## Security notes & limitations
 
 - **Your password is the whole game.** Argon2id makes brute force costly, but a
-  weak passphrase is still weak. Choose a strong one.
+  weak passphrase is still weak. Choose a strong one. When you create (`init`) or
+  change (`passwd`) a vault password, envvault prints a strength estimate (via
+  zxcvbn) — a 0–4 score, an estimated offline crack time, and concrete
+  suggestions. It's advisory: a weak password is reported, never rejected.
 - `show` and the editor's "reveal" deliberately display secrets on screen — use
   them intentionally.
 - Once a secret is handed to a child process it lives in that child's

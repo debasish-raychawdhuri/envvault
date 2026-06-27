@@ -49,7 +49,55 @@ pub fn prompt_new() -> Result<Zeroizing<String>> {
     if first != confirm {
         bail!("passwords did not match");
     }
+    eprintln!("{}", strength_report(&first));
     Ok(Zeroizing::new(first))
+}
+
+/// Build a human-readable password-strength assessment — score, estimated
+/// offline crack time, and any concrete suggestions — using the zxcvbn
+/// estimator. Informational only: a weak password is reported, never rejected
+/// (the choice is the user's).
+fn strength_report(password: &str) -> String {
+    let estimate = zxcvbn::zxcvbn(password, &[]);
+    let score = u8::from(estimate.score());
+    let label = match score {
+        0 => "very weak",
+        1 => "weak",
+        2 => "fair",
+        3 => "strong",
+        _ => "very strong",
+    };
+    let crack = estimate
+        .crack_times()
+        .offline_slow_hashing_1e4_per_second();
+    let mut out =
+        format!("Password strength: {score}/4 ({label}) — est. offline crack time: {crack}");
+    if let Some(feedback) = estimate.feedback() {
+        if let Some(warning) = feedback.warning() {
+            out.push_str(&format!("\n  warning: {warning}"));
+        }
+        for suggestion in feedback.suggestions() {
+            out.push_str(&format!("\n  suggestion: {suggestion}"));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn weak_password_scores_low() {
+        let r = strength_report("password");
+        assert!(r.contains("weak"), "expected a weak rating, got: {r}");
+    }
+
+    #[test]
+    fn strong_passphrase_scores_high() {
+        let r = strength_report("correct-horse-battery-staple-9free");
+        assert!(r.contains("strong"), "expected a strong rating, got: {r}");
+    }
 }
 
 fn require_tty() -> Result<()> {
