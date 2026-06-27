@@ -243,8 +243,9 @@ envvault passwd work
 envvault run work -- python train.py
 envvault run work -- bash -lc 'echo $OPENAI_API_KEY'
 
-# Add or update secrets — prompts (no echo) for each value, so the secret
-# never appears on the command line, in shell history, or in /proc/<pid>/cmdline
+# Add or update secrets — prompts (no echo) for each value (so it never appears
+# on the command line, in shell history, or in /proc/<pid>/cmdline), then wipes
+# the clipboard after each value, since secrets are pasted rather than typed
 envvault set work OPENAI_API_KEY DATABASE_URL
 
 # Remove keys
@@ -263,7 +264,7 @@ envvault show work
 | `edit <name>`            | Open the interactive TUI to manage secrets. |
 | `passwd <name>`          | Change the vault's password (verifies the old one, re-encrypts under the new). |
 | `run <name> -- <cmd>…`   | Decrypt in memory and run `<cmd>` with the secrets in its environment. |
-| `set <name> KEY …`       | Add/update keys; the value for each is entered at a no-echo prompt. |
+| `set <name> KEY …`       | Add/update keys; each value entered at a no-echo prompt, then the clipboard is wiped. |
 | `rm <name> KEY …`        | Remove one or more keys. |
 | `show <name>`            | Print decrypted `KEY=VALUE` lines to stdout. |
 

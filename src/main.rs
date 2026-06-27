@@ -225,13 +225,26 @@ fn cmd_set(name: &str, keys: &[String]) -> Result<()> {
         vault::validate_key(key)?;
     }
     let (session, mut vault) = open_vault(&path, false)?;
+    // Secret values are pasted, not typed, so wipe the system clipboard after
+    // each one is entered. The handle is held across the loop so the emptied
+    // selection keeps being served on X11; `None` if no clipboard is reachable
+    // (e.g. headless / SSH without a display).
+    let mut clipboard = arboard::Clipboard::new().ok();
     for key in keys {
         let value = password::prompt_value(key)?;
         vault.set(key, &value);
+        if let Some(cb) = clipboard.as_mut() {
+            let _ = cb.clear();
+        }
     }
     session.save(&path, vault.serialize().as_bytes())?;
+    let cleared = if clipboard.is_some() {
+        " — clipboard cleared"
+    } else {
+        ""
+    };
     println!(
-        "Updated {} entr{}",
+        "Updated {} entr{}{cleared}",
         keys.len(),
         if keys.len() == 1 { "y" } else { "ies" }
     );
