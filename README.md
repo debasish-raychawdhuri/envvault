@@ -343,6 +343,27 @@ program's whole lifetime to exactly the same-uid attacker envvault exists to
 resist. `run` prints a one-line reminder of this on each use (silence it with
 `--quiet` or `ENVVAULT_QUIET=1`).
 
+It's worth being clear where this sits relative to other tools, without
+overstating it. **The runtime exposure is not specific to envvault** — it is
+inherent to env injection, so every tool that hands a secret to a program
+through its environment (`direnv`, `dotenvx`, the `run` commands of cloud secret
+managers, `sops exec-env`, …) shares it. What still differs is two things:
+
+- **At rest.** Even in `run` mode the secret stays encrypted whenever the
+  program isn't running — there is no plaintext `.env` or key file sitting on
+  disk the rest of the time. That makes `run` meaningfully safer than a plaintext
+  dotenv file despite the identical *runtime* exposure.
+- **Whether there's an off-environment path, and what it costs.** Some tools
+  offer only env injection (`direnv`, `dotenvx`) with no alternative. Tools that
+  can hand a secret to a *file* often write plaintext to disk by default (e.g.
+  `sops exec-file`) — trading the environ exposure for an at-rest one — though
+  some provide a no-disk option (e.g. `sops --fifo`, a named pipe). `dir run` is
+  envvault's take: the plaintext exists only on a namespace-private tmpfs —
+  encrypted at rest, hidden from other same-uid processes, re-encrypted in place
+  on exit — so it avoids *both* leaks rather than swapping one for the other. It
+  is not the only off-environment mechanism that exists, but it is built not to
+  reintroduce a disk exposure in the process.
+
 **So prefer `dir run` whenever the tool can read its secret from a file** — there
 the plaintext lives only on a namespace-private tmpfs and never enters any
 environment. Two patterns cover almost everything:
@@ -358,6 +379,45 @@ environment. Two patterns cover almost everything:
 
 Reach for `run` only when a program accepts its secret **exclusively** as an
 environment-variable value — and do so knowing the exposure above.
+
+### Hardening env injection: `run --harden` (Linux)
+
+For programs that *only* take a secret via the environment, `--harden` closes the
+`/proc/<pid>/environ` exposure on Linux:
+
+```sh
+envvault run work --harden -- ./my-tool
+```
+
+It works by **not** putting the secrets in the program's initial environment.
+Instead envvault preloads a tiny shim (`LD_PRELOAD`) that, before the program's
+`main()` runs, marks the process **non-dumpable** (`prctl(PR_SET_DUMPABLE,0)`,
+which blocks same-uid reads of *both* `/proc/<pid>/environ` and
+`/proc/<pid>/mem`), signals envvault that it is safe, and only then receives the
+secrets over a pipe and injects them with `setenv()` so the program reads them
+normally via `getenv()`. Because the secrets are withheld until that signal,
+there is no startup-race window.
+
+**It fails closed.** If the shim doesn't load — a **statically-linked** binary, a
+**setuid** program, or `LD_PRELOAD` otherwise ignored — envvault never receives
+the signal, never sends the secrets, and aborts with an error. Nothing leaks; the
+program simply doesn't run.
+
+Limitations to know:
+
+- **Linux only** (needs `prctl` + `LD_PRELOAD`); on other platforms `--harden`
+  errors.
+- **Dynamically-linked, non-setuid programs only** — static binaries can't be
+  preloaded (they fail closed, by design).
+- If the program **re-execs** itself or **spawns children**, those children are
+  dumpable again and inherit the now-`setenv`'d secrets in their *initial*
+  environment — so the protection covers the launched process, not arbitrary
+  descendants it creates.
+- It does not defend against root, or against the program leaking the secret
+  itself.
+
+Within those limits, `--harden` gives env-only tools the same same-uid runtime
+protection that `dir run` gives file-based ones.
 
 ---
 

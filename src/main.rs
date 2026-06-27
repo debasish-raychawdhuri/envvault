@@ -70,6 +70,12 @@ enum Cmd {
         /// Suppress the environment-exposure warning (also via ENVVAULT_QUIET=1).
         #[arg(long, short)]
         quiet: bool,
+        /// Linux only: keep the secrets out of /proc/<pid>/environ by preloading
+        /// a shim that marks the program non-dumpable and receives the secrets
+        /// over a pipe after it is safe. Fails closed if the shim can't load
+        /// (e.g. a static or setuid binary).
+        #[arg(long)]
+        harden: bool,
         /// The program to run, followed by its arguments (use `--` first).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true, num_args = 1..)]
         command: Vec<String>,
@@ -193,8 +199,9 @@ fn run_cli() -> Result<()> {
             name,
             password_stdin,
             quiet,
+            harden,
             command,
-        } => cmd_run(&name, password_stdin, quiet, &command),
+        } => cmd_run(&name, password_stdin, quiet, harden, &command),
         Cmd::Set { name, keys } => cmd_set(&name, &keys),
         Cmd::Rm {
             name,
@@ -328,14 +335,20 @@ fn cmd_rename(old: &str, new: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_run(name: &str, password_stdin: bool, quiet: bool, command: &[String]) -> Result<()> {
+fn cmd_run(
+    name: &str,
+    password_stdin: bool,
+    quiet: bool,
+    harden: bool,
+    command: &[String],
+) -> Result<()> {
     let path = resolve_existing(name)?;
     let (_session, vault) = open_vault(&path, password_stdin)?;
     let (program, args) = command
         .split_first()
         .expect("clap guarantees at least one element");
     let quiet = quiet || std::env::var_os("ENVVAULT_QUIET").is_some();
-    run::run(&vault, program, args, quiet)
+    run::run(&vault, program, args, quiet, harden)
 }
 
 // --- directory vaults -----------------------------------------------------

@@ -11,6 +11,11 @@ readme = "README.md"
 name = "envvault"
 path = "src/main.rs"
 
+[build-dependencies]
+# Locate a C compiler at build time to compile the `env run --harden` LD_PRELOAD
+# shim (shim/harden.c) into an embedded shared object.
+cc = "1"
+
 [dependencies]
 # CLI
 clap = { version = "4.4", features = ["derive"] }
