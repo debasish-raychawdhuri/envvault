@@ -6,6 +6,7 @@ use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
 
 const VAULT_EXT: &str = "vault";
+const DIRVAULT_EXT: &str = "dirvault";
 
 /// The directory that holds all vaults. Overridable with `$ENVVAULT_DIR`;
 /// otherwise `<config-dir>/envvault` (e.g. `~/.config/envvault` on Linux).
@@ -37,8 +38,26 @@ pub fn vault_path(name: &str) -> Result<PathBuf> {
     Ok(ensure_vault_dir()?.join(format!("{name}.{VAULT_EXT}")))
 }
 
-/// Names of all vaults present in the vault directory, sorted.
+/// Resolve a directory-vault name to its `<name>.dirvault` path.
+pub fn dirvault_path(name: &str) -> Result<PathBuf> {
+    validate_name(name)?;
+    Ok(ensure_vault_dir()?.join(format!("{name}.{DIRVAULT_EXT}")))
+}
+
+/// Names of all env-var vaults present in the vault directory, sorted.
 pub fn list_vaults() -> Result<Vec<String>> {
+    list_with_ext(VAULT_EXT)
+}
+
+/// Names of all directory vaults present in the vault directory, sorted.
+pub fn list_dirvaults() -> Result<Vec<String>> {
+    list_with_ext(DIRVAULT_EXT)
+}
+
+/// Collect the file stems of all files with the given extension in the vault
+/// directory, sorted. (`<name>.vault` and `<name>.dirvault` never collide,
+/// since `.dirvault`'s extension is `dirvault`, not `vault`.)
+fn list_with_ext(ext: &str) -> Result<Vec<String>> {
     let dir = vault_dir()?;
     if !dir.exists() {
         return Ok(Vec::new());
@@ -48,7 +67,7 @@ pub fn list_vaults() -> Result<Vec<String>> {
         .with_context(|| format!("failed to read vault directory {}", dir.display()))?
     {
         let path = entry?.path();
-        if path.extension().and_then(|e| e.to_str()) == Some(VAULT_EXT)
+        if path.extension().and_then(|e| e.to_str()) == Some(ext)
             && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
         {
             names.push(stem.to_string());

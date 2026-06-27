@@ -48,6 +48,9 @@ arboard = { version = "3", default-features = false, features = ["wayland-data-c
 # Locating the per-user config directory
 dirs = "5"
 
+# Archive a directory tree to/from bytes for directory vaults (pure Rust)
+tar = "0.4"
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

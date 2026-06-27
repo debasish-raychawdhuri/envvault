@@ -6,9 +6,11 @@
 //! (`$ENVVAULT_DIR`, else `<config-dir>/envvault`), one encrypted file each.
 
 mod crypto;
+mod dirvault;
 mod harden;
 mod password;
 mod run;
+mod sandbox;
 mod store;
 mod tui;
 mod vault;
@@ -89,6 +91,59 @@ enum Cmd {
     },
     /// List all vaults in the vault directory.
     List,
+    /// Manage directory vaults: keep a tool's config dir (e.g. ~/.claude)
+    /// encrypted at rest, decrypted only in RAM while a program runs.
+    Dir {
+        #[command(subcommand)]
+        command: DirCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum DirCmd {
+    /// Encrypt a directory's contents into a vault, then empty the directory.
+    Init {
+        /// Name for the new directory vault.
+        name: String,
+        /// The directory whose contents to encrypt (e.g. ~/.claude).
+        #[arg(long)]
+        path: String,
+        /// Skip the confirmation prompt before emptying the directory.
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        password_stdin: bool,
+    },
+    /// Decrypt into RAM at the original path, run a program, re-encrypt on exit.
+    Run {
+        name: String,
+        #[arg(long)]
+        password_stdin: bool,
+        /// The program to run, followed by its arguments (use `--` first).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true, num_args = 1..)]
+        command: Vec<String>,
+    },
+    /// List all directory vaults.
+    List,
+    /// Print a directory vault's stored target path.
+    Status {
+        name: String,
+        #[arg(long)]
+        password_stdin: bool,
+    },
+    /// Decrypt a directory vault's contents into a directory (writes plaintext!).
+    Export {
+        name: String,
+        /// Destination directory (created if missing).
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        password_stdin: bool,
+    },
+    /// Delete a directory vault file (its encrypted contents are lost).
+    Rm {
+        name: String,
+    },
 }
 
 fn main() {
@@ -129,6 +184,34 @@ fn run_cli() -> Result<()> {
             password_stdin,
         } => cmd_show(&name, password_stdin),
         Cmd::List => cmd_list(),
+        Cmd::Dir { command } => run_dir(command),
+    }
+}
+
+fn run_dir(command: DirCmd) -> Result<()> {
+    match command {
+        DirCmd::Init {
+            name,
+            path,
+            yes,
+            password_stdin,
+        } => cmd_dir_init(&name, &path, yes, password_stdin),
+        DirCmd::Run {
+            name,
+            password_stdin,
+            command,
+        } => cmd_dir_run(&name, password_stdin, &command),
+        DirCmd::List => cmd_dir_list(),
+        DirCmd::Status {
+            name,
+            password_stdin,
+        } => cmd_dir_status(&name, password_stdin),
+        DirCmd::Export {
+            name,
+            to,
+            password_stdin,
+        } => cmd_dir_export(&name, &to, password_stdin),
+        DirCmd::Rm { name } => cmd_dir_rm(&name),
     }
 }
 
@@ -215,6 +298,149 @@ fn cmd_run(name: &str, password_stdin: bool, command: &[String]) -> Result<()> {
         .split_first()
         .expect("clap guarantees at least one element");
     run::run(&vault, program, args)
+}
+
+// --- directory vaults -----------------------------------------------------
+
+/// Resolve a directory-vault name to its file path, erroring (with the list of
+/// available directory vaults) if it does not exist yet.
+fn resolve_existing_dirvault(name: &str) -> Result<std::path::PathBuf> {
+    let path = store::dirvault_path(name)?;
+    if !path.exists() {
+        let available = store::list_dirvaults()?;
+        if available.is_empty() {
+            bail!("no directory vault named '{name}' (create one with `envvault dir init {name} --path <dir>`)");
+        }
+        bail!(
+            "no directory vault named '{name}'. Available: {}",
+            available.join(", ")
+        );
+    }
+    Ok(path)
+}
+
+/// Delete everything inside `dir` but keep `dir` itself, so it stays a valid
+/// mountpoint for `dir run`.
+fn empty_dir(dir: &Path) -> Result<()> {
+    for entry in
+        std::fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))?
+    {
+        let path = entry?.path();
+        let meta = std::fs::symlink_metadata(&path)?;
+        if meta.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        }
+        .with_context(|| format!("failed to remove {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn cmd_dir_init(name: &str, path: &str, yes: bool, password_stdin: bool) -> Result<()> {
+    let vault_path = store::dirvault_path(name)?;
+    if vault_path.exists() {
+        bail!("a directory vault named '{name}' already exists — refusing to overwrite");
+    }
+    let target = Path::new(path);
+    if !target.is_dir() {
+        bail!("{} is not an existing directory", target.display());
+    }
+    let canonical = target
+        .canonicalize()
+        .with_context(|| format!("could not resolve {}", target.display()))?;
+
+    // Emptying the directory is destructive — confirm unless told not to.
+    if !yes {
+        if password_stdin {
+            bail!(
+                "refusing to empty {} without confirmation; pass --yes",
+                canonical.display()
+            );
+        }
+        eprint!(
+            "This will encrypt {} into vault '{name}' and then DELETE its contents. Continue? [y/N] ",
+            canonical.display()
+        );
+        use std::io::Write;
+        std::io::stderr().flush().ok();
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        if !matches!(line.trim(), "y" | "Y" | "yes") {
+            bail!("aborted");
+        }
+    }
+
+    let pw = if password_stdin {
+        password::read_stdin()?
+    } else {
+        password::prompt_new()?
+    };
+    dirvault::create(&vault_path, pw.as_bytes(), &canonical)?;
+    empty_dir(&canonical)?;
+    println!(
+        "Created directory vault '{name}' from {} and emptied it.\n\
+         Use it with: envvault dir run {name} -- <command>",
+        canonical.display()
+    );
+    Ok(())
+}
+
+fn cmd_dir_run(name: &str, password_stdin: bool, command: &[String]) -> Result<()> {
+    let vault_path = resolve_existing_dirvault(name)?;
+    let (program, args) = command
+        .split_first()
+        .expect("clap guarantees at least one element");
+    // The vault is opened (password prompt + decrypt) by this closure, which
+    // `sandbox::run` calls only after setting up the namespace and re-hardening
+    // the process — so no secret exists during the brief dumpable window.
+    sandbox::run(&vault_path, program, args, || {
+        let pw = get_password(password_stdin)?;
+        dirvault::open(&vault_path, pw.as_bytes())
+    })
+}
+
+fn cmd_dir_list() -> Result<()> {
+    let vaults = store::list_dirvaults()?;
+    if vaults.is_empty() {
+        println!("No directory vaults yet. Create one with `envvault dir init <name> --path <dir>`.");
+    } else {
+        for name in vaults {
+            println!("{name}");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_dir_status(name: &str, password_stdin: bool) -> Result<()> {
+    let vault_path = resolve_existing_dirvault(name)?;
+    let pw = get_password(password_stdin)?;
+    let dv = dirvault::open(&vault_path, pw.as_bytes())?;
+    println!("{name}: target directory {}", dv.target().display());
+    Ok(())
+}
+
+fn cmd_dir_export(name: &str, to: &str, password_stdin: bool) -> Result<()> {
+    let vault_path = resolve_existing_dirvault(name)?;
+    let pw = get_password(password_stdin)?;
+    let dv = dirvault::open(&vault_path, pw.as_bytes())?;
+    let dest = Path::new(to);
+    std::fs::create_dir_all(dest)
+        .with_context(|| format!("failed to create {}", dest.display()))?;
+    dv.extract_into(dest)?;
+    println!(
+        "Exported '{name}' to {} (WARNING: this wrote the decrypted contents to disk).",
+        dest.display()
+    );
+    Ok(())
+}
+
+fn cmd_dir_rm(name: &str) -> Result<()> {
+    let vault_path = resolve_existing_dirvault(name)?;
+    std::fs::remove_file(&vault_path)
+        .with_context(|| format!("failed to remove {}", vault_path.display()))?;
+    println!("Removed directory vault '{name}'");
+    Ok(())
 }
 
 fn cmd_set(name: &str, keys: &[String]) -> Result<()> {
