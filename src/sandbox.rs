@@ -8,6 +8,10 @@
 //! freed automatically when the process tree exits. Nothing else on the system
 //! — not even another same-uid process — sees the plaintext at that path.
 //!
+//! While the child runs, an optional background autosaver re-encrypts the
+//! directory whenever its contents have been quiet for a debounce window, so a
+//! SIGKILL or power loss costs at most the changes since the last quiet moment.
+//!
 //! The vault is decrypted via the caller-supplied `open` closure, which we call
 //! *after* the namespace is set up and the process is re-hardened — see the
 //! dumpability dance in `linux::run`.
@@ -17,23 +21,37 @@
 use crate::dirvault::DirVault;
 use anyhow::Result;
 use std::path::Path;
+use std::time::Duration;
 
 /// Set up the RAM sandbox at the vault's target path, run `program args...`,
-/// and re-encrypt on exit. `open` decrypts the vault (prompting for the
-/// password) and is invoked only after the process has been re-hardened, so the
-/// secret never exists while the process is briefly dumpable. On a zero exit
-/// this returns `Ok(())`; otherwise it calls `std::process::exit` with the
-/// child's code.
+/// and re-encrypt on exit. If `autosave` is `Some(debounce)`, also re-encrypt
+/// during the run once changes have been quiet for `debounce`. `open` decrypts
+/// the vault (prompting for the password) and is invoked only after the process
+/// has been re-hardened, so the secret never exists while the process is briefly
+/// dumpable. On a zero exit this returns `Ok(())`; otherwise it calls
+/// `std::process::exit` with the child's code.
 #[cfg(target_os = "linux")]
-pub fn run<F>(vault_path: &Path, program: &str, args: &[String], open: F) -> Result<()>
+pub fn run<F>(
+    vault_path: &Path,
+    program: &str,
+    args: &[String],
+    autosave: Option<Duration>,
+    open: F,
+) -> Result<()>
 where
     F: FnOnce() -> Result<DirVault>,
 {
-    linux::run(vault_path, program, args, open)
+    linux::run(vault_path, program, args, autosave, open)
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn run<F>(_vault_path: &Path, _program: &str, _args: &[String], _open: F) -> Result<()>
+pub fn run<F>(
+    _vault_path: &Path,
+    _program: &str,
+    _args: &[String],
+    _autosave: Option<Duration>,
+    _open: F,
+) -> Result<()>
 where
     F: FnOnce() -> Result<DirVault>,
 {
@@ -48,13 +66,27 @@ where
 mod linux {
     use super::*;
     use anyhow::Context;
+    use std::collections::hash_map::DefaultHasher;
     use std::ffi::CString;
+    use std::hash::Hasher;
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
     use std::os::unix::process::{CommandExt, ExitStatusExt};
+    use std::path::PathBuf;
     use std::process::Command;
     use std::ptr;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Instant;
 
-    pub fn run<F>(vault_path: &Path, program: &str, args: &[String], open: F) -> Result<()>
+    pub fn run<F>(
+        vault_path: &Path,
+        program: &str,
+        args: &[String],
+        autosave: Option<Duration>,
+        open: F,
+    ) -> Result<()>
     where
         F: FnOnce() -> Result<DirVault>,
     {
@@ -90,8 +122,9 @@ mod linux {
         mount_private_root()?;
 
         // 3. Decrypt now that the process is non-dumpable again. `open` prompts
-        //    for the password and returns the target path + plaintext.
-        let dirvault = open()?;
+        //    for the password and returns the target path + plaintext. Held in
+        //    an Arc so the autosaver thread can share it.
+        let dirvault = Arc::new(open()?);
         let target = dirvault.target().to_path_buf();
 
         // 4. Mount a fresh tmpfs over the target and extract into it (RAM only).
@@ -102,11 +135,24 @@ mod linux {
             .extract_into(&target)
             .context("failed to populate the in-memory directory")?;
 
-        // 5. Ignore terminal signals in this supervisor so a Ctrl-C (or hang-up)
+        // 5. Optionally start the debounced autosaver (spawned after unshare, so
+        //    the single-thread requirement for CLONE_NEWUSER was already met).
+        let stop = Arc::new(AtomicBool::new(false));
+        let autosaver = autosave.map(|debounce| {
+            spawn_autosaver(
+                Arc::clone(&dirvault),
+                vault_path.to_path_buf(),
+                target.clone(),
+                debounce,
+                Arc::clone(&stop),
+            )
+        });
+
+        // 6. Ignore terminal signals in this supervisor so a Ctrl-C (or hang-up)
         //    goes to the child and we still reach the re-encrypt step.
         ignore_signals();
 
-        // 6. Spawn the child (it inherits the namespace and the tmpfs view).
+        // 7. Spawn the child (it inherits the namespace and the tmpfs view).
         let mut cmd = Command::new(program);
         cmd.args(args);
         unsafe {
@@ -123,23 +169,91 @@ mod linux {
             .wait()
             .context("failed waiting for child process")?;
 
-        // 7. Re-encrypt whatever the child left behind, from the same ns.
+        // 8. Stop the autosaver and flush a final, authoritative snapshot.
+        stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = autosaver {
+            let _ = handle.join();
+        }
         if let Err(e) = dirvault.save_from(vault_path, &target) {
             eprintln!(
                 "error: failed to re-encrypt directory vault: {e:#}\n\
-                 The child's changes were NOT saved; the vault on disk is unchanged."
+                 The child's latest changes were NOT saved; the vault on disk \
+                 reflects the last successful save."
             );
             drop(dirvault);
             std::process::exit(1);
         }
         drop(dirvault); // wipe decrypted plaintext before exiting
 
-        // 8. Propagate the child's exit status. (Process exit tears down the
+        // 9. Propagate the child's exit status. (Process exit tears down the
         //    namespace, unmounting and freeing the tmpfs automatically.)
         match status.code() {
             Some(0) => Ok(()),
             Some(code) => std::process::exit(code),
             None => std::process::exit(128 + status.signal().unwrap_or(0)),
+        }
+    }
+
+    /// Watch `target` and re-encrypt to `vault_path` once its contents have been
+    /// unchanged for `debounce`. Polls a cheap fingerprint (paths + sizes +
+    /// mtimes); credential dirs are tiny so this is negligible. Stops when
+    /// `stop` is set.
+    fn spawn_autosaver(
+        dirvault: Arc<DirVault>,
+        vault_path: PathBuf,
+        target: PathBuf,
+        debounce: Duration,
+        stop: Arc<AtomicBool>,
+    ) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            let poll = Duration::from_millis(500);
+            let mut last_seen = dir_fingerprint(&target);
+            let mut last_saved = last_seen; // the just-extracted state is on disk
+            let mut last_change = Instant::now();
+            while !stop.load(Ordering::Relaxed) {
+                thread::sleep(poll);
+                let fp = dir_fingerprint(&target);
+                if fp != last_seen {
+                    last_seen = fp;
+                    last_change = Instant::now();
+                }
+                // Save once changes have settled and there's something new.
+                if last_seen != last_saved && last_change.elapsed() >= debounce {
+                    match dirvault.save_from(&vault_path, &target) {
+                        Ok(()) => last_saved = last_seen,
+                        Err(e) => eprintln!("warning: autosave failed: {e:#}"),
+                    }
+                }
+            }
+        })
+    }
+
+    /// A cheap fingerprint of a directory tree: every entry's path, size, and
+    /// mtime folded into one number. Changes when files are added, removed,
+    /// resized, or rewritten (which bumps mtime).
+    fn dir_fingerprint(dir: &Path) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        fingerprint_into(dir, &mut hasher);
+        hasher.finish()
+    }
+
+    fn fingerprint_into(dir: &Path, hasher: &mut DefaultHasher) {
+        let read = match std::fs::read_dir(dir) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        let mut paths: Vec<PathBuf> = read.flatten().map(|e| e.path()).collect();
+        paths.sort();
+        for path in &paths {
+            hasher.write(path.as_os_str().as_bytes());
+            if let Ok(meta) = std::fs::symlink_metadata(path) {
+                hasher.write_u64(meta.len());
+                hasher.write_i64(meta.mtime());
+                hasher.write_i64(meta.mtime_nsec());
+                if meta.is_dir() {
+                    fingerprint_into(path, hasher);
+                }
+            }
         }
     }
 

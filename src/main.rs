@@ -119,6 +119,12 @@ enum DirCmd {
         name: String,
         #[arg(long)]
         password_stdin: bool,
+        /// Don't re-encrypt while the program runs (only on exit).
+        #[arg(long)]
+        no_autosave: bool,
+        /// Seconds the directory must be unchanged before an autosave fires.
+        #[arg(long, default_value_t = 2)]
+        autosave_debounce: u64,
         /// The program to run, followed by its arguments (use `--` first).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true, num_args = 1..)]
         command: Vec<String>,
@@ -199,8 +205,10 @@ fn run_dir(command: DirCmd) -> Result<()> {
         DirCmd::Run {
             name,
             password_stdin,
+            no_autosave,
+            autosave_debounce,
             command,
-        } => cmd_dir_run(&name, password_stdin, &command),
+        } => cmd_dir_run(&name, password_stdin, no_autosave, autosave_debounce, &command),
         DirCmd::List => cmd_dir_list(),
         DirCmd::Status {
             name,
@@ -386,15 +394,26 @@ fn cmd_dir_init(name: &str, path: &str, yes: bool, password_stdin: bool) -> Resu
     Ok(())
 }
 
-fn cmd_dir_run(name: &str, password_stdin: bool, command: &[String]) -> Result<()> {
+fn cmd_dir_run(
+    name: &str,
+    password_stdin: bool,
+    no_autosave: bool,
+    autosave_debounce: u64,
+    command: &[String],
+) -> Result<()> {
     let vault_path = resolve_existing_dirvault(name)?;
     let (program, args) = command
         .split_first()
         .expect("clap guarantees at least one element");
+    let autosave = if no_autosave {
+        None
+    } else {
+        Some(std::time::Duration::from_secs(autosave_debounce))
+    };
     // The vault is opened (password prompt + decrypt) by this closure, which
     // `sandbox::run` calls only after setting up the namespace and re-hardening
     // the process — so no secret exists during the brief dumpable window.
-    sandbox::run(&vault_path, program, args, || {
+    sandbox::run(&vault_path, program, args, autosave, || {
         let pw = get_password(password_stdin)?;
         dirvault::open(&vault_path, pw.as_bytes())
     })

@@ -349,7 +349,7 @@ real disk.
 | Command | What it does |
 |---------|--------------|
 | `dir init <name> --path <dir>` | Encrypt `<dir>`'s contents into a vault, then empty the directory. |
-| `dir run <name> -- <cmd>…`     | Decrypt into RAM at the original path, run `<cmd>`, re-encrypt on exit. |
+| `dir run <name> -- <cmd>…`     | Decrypt into RAM at the original path, run `<cmd>`, re-encrypt on changes and on exit. |
 | `dir list`                     | List all directory vaults. |
 | `dir status <name>`            | Print the vault's stored target path. |
 | `dir export <name> --to <dir>` | Decrypt the contents into `<dir>` (writes plaintext to disk!). |
@@ -388,9 +388,12 @@ real disk.
   recoverable from free space until overwritten (especially on SSDs/CoW
   filesystems). Secrets written *later* by a tool inside `dir run` only ever
   live in the tmpfs, never on the real disk.
-- If a `dir run` is `SIGKILL`ed or the machine loses power, changes the child
-  made since launch are lost — the on-disk vault reflects the last clean exit.
-  Ordinary exits, Ctrl-C, and `SIGTERM` are handled and trigger re-encryption.
+- While the program runs, envvault re-encrypts to disk automatically once the
+  directory has been quiet for a debounce window (default 2s; tune with
+  `--autosave-debounce <secs>`, turn off with `--no-autosave`), plus a final
+  save on exit. So a `SIGKILL` or power loss costs at most the changes made
+  since the last quiet moment — not the whole session. Ordinary exits, Ctrl-C,
+  and `SIGTERM` always trigger a final re-encryption.
 - The namespace-private tmpfs hides the plaintext from *passive* same-uid
   access, but not from a same-uid attacker who actively targets the running
   child (e.g. `/proc/<child_pid>/root/`, `setns`). After `exec` the child is
