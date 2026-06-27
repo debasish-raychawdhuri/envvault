@@ -282,6 +282,10 @@ envvault upgrade work
 envvault run work -- python train.py
 envvault run work -- bash -lc 'echo $OPENAI_API_KEY'
 
+# Launch an agent with its secret AND a credential sandbox for the whole session
+# (Linux): ~/.aws, ~/.gnupg, … are structurally hidden; ~/.ssh stays visible
+envvault run work --allow ~/.ssh -- claude
+
 # Add or update secrets — prompts (no echo) for each value (so it never appears
 # on the command line, in shell history, or in /proc/<pid>/cmdline), then wipes
 # the clipboard after each value, since secrets are pasted rather than typed
@@ -308,7 +312,7 @@ envvault unrun --hide ~/.config/some-tool -- ./suspicious-script
 | `edit <name>`            | Open the interactive TUI to manage secrets. |
 | `passwd <name>`          | Change the vault's password (verifies the old one, re-encrypts under the new). |
 | `upgrade <name>`         | Re-encrypt under the current Argon2id parameters (no-op if already current). |
-| `run <name> -- <cmd>…`   | Decrypt in memory and run `<cmd>` with the secrets in its environment. |
+| `run <name> -- <cmd>…`   | Decrypt in memory and run `<cmd>` with the secrets in its environment. `--harden` keeps them off `/proc`; `--sandbox`/`--allow <path>` hide your credential files for the session (Linux). |
 | `unrun -- <cmd>…`        | Run `<cmd>` with your credential files **hidden** from it (Linux). `--hide <path>` adds more. |
 | `set <name> KEY …`       | Add/update keys; each value entered at a no-echo prompt, then the clipboard is wiped. |
 | `rename <old> <new>`     | Rename a vault. |
@@ -545,6 +549,40 @@ deny-everything jail:
   and vanish on exit; the real file is untouched.
 - **Linux only** (needs unprivileged user + mount namespaces); errors clearly
   elsewhere, or if those namespaces are disabled.
+
+### `run --sandbox` / `--allow`: a real boundary for a whole agent session
+
+`unrun` is a per-command convenience, but a per-command, binary-mediated hide is
+**not a security boundary**: code inside a session could shadow `envvault` on
+`$PATH`, `LD_PRELOAD` the real one into a no-op, `ptrace` it, or just never call
+it. Anything that depends on a *binary* behaving can be bypassed.
+
+The durable boundary is **kernel namespace state, applied once by the trusted
+launcher before any untrusted code runs.** So when you start an agent, launch it
+through `run` with the sandbox on:
+
+```sh
+envvault run work --allow ~/.ssh -- claude   # claude gets its secret; ~/.aws,
+                                             # ~/.gnupg, … are gone for the whole
+                                             # session, ~/.ssh stays visible
+envvault run work --sandbox -- claude        # hide all of them (allow nothing)
+```
+
+`run` masks every default credential path **except** the `--allow`ed ones in the
+session's mount namespace, then delivers the vault secret and runs the program.
+From that instant the disallowed creds don't exist for the program **or anything
+it spawns**, and hiding is monotonic — *nothing nested inside can bring them
+back*: not a fake `unrun`, not a shadowed `envvault`, not a preloaded `.so`, not
+code that skips sandboxing entirely. A nested `unrun` can only hide *more*.
+
+Why `--allow` is on `run` and never on `unrun`: the launcher is trusted (you run
+it), but `unrun` is invoked by the code you don't trust — an `--allow` there
+would let that code grant itself access. The allowed set is therefore a ceiling
+set by the human; `unrun` inside inherits it (via `$ENVVAULT_ALLOW`) and may
+tighten it, but can never widen it. Even if that soft inherited list is tampered
+with, it can only affect the *already-visible* allowed paths — never the
+structurally-removed ones. `--harden` and `--sandbox` compose (hardened secret
+delivery + masked session).
 
 ## Security notes & limitations
 

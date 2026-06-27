@@ -88,6 +88,15 @@ enum Cmd {
         /// (e.g. a static or setuid binary).
         #[arg(long)]
         harden: bool,
+        /// Linux: hide your credential files (~/.ssh, ~/.aws, …) from the program
+        /// and everything it spawns, for the whole session. Structural — nothing
+        /// inside the session can undo it.
+        #[arg(long)]
+        sandbox: bool,
+        /// Linux: a credential path to leave visible under the sandbox
+        /// (repeatable); implies --sandbox. Nested `unrun` inherits these.
+        #[arg(long)]
+        allow: Vec<String>,
         /// The program to run, followed by its arguments (use `--` first).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true, num_args = 1..)]
         command: Vec<String>,
@@ -235,8 +244,10 @@ fn run_cli() -> Result<()> {
             password_stdin,
             quiet,
             harden,
+            sandbox,
+            allow,
             command,
-        } => cmd_run(&name, password_stdin, quiet, harden, &command),
+        } => cmd_run(&name, password_stdin, quiet, harden, sandbox, &allow, &command),
         Cmd::Unrun { hide, command } => cmd_unrun(&hide, &command),
         Cmd::Set { name, keys } => cmd_set(&name, &keys),
         Cmd::Rm {
@@ -461,15 +472,48 @@ const UNRUN_DEFAULT_HIDE: &[&str] = &[
     ".databrickscfg",
 ];
 
-fn cmd_unrun(extra_hide: &[String], command: &[String]) -> Result<()> {
-    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+/// Expand a leading `~/` to the home directory; otherwise take the path as-is.
+/// Used to normalize `--allow` / `--hide` / `$ENVVAULT_ALLOW` entries so they
+/// compare equal to the absolute `default_cred_paths`.
+fn normalize_path(s: &str) -> std::path::PathBuf {
+    if let Some(rest) = s.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(rest);
+    }
+    std::path::PathBuf::from(s)
+}
+
+/// The built-in credential paths, resolved under $HOME.
+fn default_cred_paths() -> Vec<std::path::PathBuf> {
+    let mut v = Vec::new();
     if let Some(home) = dirs::home_dir() {
         for rel in UNRUN_DEFAULT_HIDE {
-            paths.push(home.join(rel));
+            v.push(home.join(rel));
         }
     }
+    v
+}
+
+/// The soft allow-list a parent `run --allow` exported, parsed from
+/// `$ENVVAULT_ALLOW` (colon-separated, normalized). Only affects which already-
+/// visible paths `unrun` declines to re-hide; it can never expose a path the
+/// parent structurally removed from the namespace.
+fn inherited_allow() -> Vec<std::path::PathBuf> {
+    std::env::var("ENVVAULT_ALLOW")
+        .ok()
+        .map(|s| s.split(':').filter(|x| !x.is_empty()).map(normalize_path).collect())
+        .unwrap_or_default()
+}
+
+fn cmd_unrun(extra_hide: &[String], command: &[String]) -> Result<()> {
+    let allow = inherited_allow();
+    let mut paths: Vec<std::path::PathBuf> = default_cred_paths()
+        .into_iter()
+        .filter(|p| !allow.contains(p))
+        .collect();
     for p in extra_hide {
-        paths.push(std::path::PathBuf::from(p));
+        paths.push(normalize_path(p));
     }
     let (program, args) = command
         .split_first()
@@ -482,14 +526,46 @@ fn cmd_run(
     password_stdin: bool,
     quiet: bool,
     harden: bool,
+    sandbox: bool,
+    allow: &[String],
     command: &[String],
 ) -> Result<()> {
     let path = resolve_existing(name)?;
-    let (_session, vault) = open_vault(&path, password_stdin)?;
     let (program, args) = command
         .split_first()
         .expect("clap guarantees at least one element");
     let quiet = quiet || std::env::var_os("ENVVAULT_QUIET").is_some();
+
+    // --allow implies --sandbox.
+    if sandbox || !allow.is_empty() {
+        let allow: Vec<std::path::PathBuf> = allow.iter().map(|s| normalize_path(s)).collect();
+        // 1. Enter the masked namespace BEFORE decrypting, so no secret is in
+        //    memory during the brief dumpable id-map window.
+        sandbox::enter_user_mount_ns()?;
+        // 2. Decrypt now (still non-dumpable; the vault dir is still visible).
+        let (_session, vault) = open_vault(&path, password_stdin)?;
+        // 3. Structurally hide every default credential path except the allowed
+        //    ones — the hard boundary, set before any untrusted code runs.
+        let mask: Vec<std::path::PathBuf> = default_cred_paths()
+            .into_iter()
+            .filter(|p| !allow.contains(p))
+            .collect();
+        sandbox::mask_paths(&mask)?;
+        // 4. Export the (soft) allow-list so a nested `unrun` won't re-hide the
+        //    paths the human chose to leave visible.
+        let allow_env = allow
+            .iter()
+            .filter_map(|p| p.to_str())
+            .collect::<Vec<_>>()
+            .join(":");
+        // SAFETY: single-threaded here, before any child is spawned.
+        unsafe { std::env::set_var("ENVVAULT_ALLOW", allow_env) };
+        // 5. Run inside the masked namespace (exec, or fork under --harden); the
+        //    child inherits the namespace and every mask.
+        return run::run(&vault, program, args, quiet, harden);
+    }
+
+    let (_session, vault) = open_vault(&path, password_stdin)?;
     run::run(&vault, program, args, quiet, harden)
 }
 

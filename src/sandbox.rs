@@ -81,6 +81,36 @@ pub fn unrun(_program: &str, _args: &[String], _hide: &[std::path::PathBuf]) -> 
     )
 }
 
+/// Enter a private user+mount namespace in the *current* process, so subsequent
+/// `mask_paths` calls hide paths only from this process and its children. Used
+/// by `run --sandbox` to establish the masked session before exec/harden. Linux
+/// only — the boundary is the namespace, set up by the trusted launcher before
+/// any untrusted code runs.
+#[cfg(target_os = "linux")]
+pub fn enter_user_mount_ns() -> Result<()> {
+    linux::enter_user_mount_ns()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn enter_user_mount_ns() -> Result<()> {
+    anyhow::bail!(
+        "credential sandboxing (`run --sandbox`/`--allow`) is only supported on Linux — \
+         it relies on unprivileged user + mount namespaces."
+    )
+}
+
+/// Mask each path in `paths` with an empty overlay in the current mount
+/// namespace (call after `enter_user_mount_ns`). Linux only.
+#[cfg(target_os = "linux")]
+pub fn mask_paths(paths: &[std::path::PathBuf]) -> Result<()> {
+    linux::mask_paths(paths)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn mask_paths(_paths: &[std::path::PathBuf]) -> Result<()> {
+    anyhow::bail!("credential sandboxing is only supported on Linux.")
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
@@ -252,12 +282,13 @@ mod linux {
         }
     }
 
-    /// Run `program` with every path in `hide` masked by an empty overlay, in a
-    /// private mount namespace. Inverse of `run`: it hides instead of reveals,
-    /// so there is no decrypt, no re-encrypt, and nothing to restore — the real
-    /// files are never touched and the namespace is discarded on exit.
-    pub fn unrun(program: &str, args: &[String], hide: &[PathBuf]) -> Result<()> {
-        // Capture real ids before unshare, then the same dance as `run`.
+    /// Enter a fresh private user+mount namespace in the current process: the
+    /// unshare + id-map + re-harden + private-root dance (same as `run`). Must be
+    /// called while single-threaded. Afterwards, mounts made here are private to
+    /// this process and its children.
+    pub fn enter_user_mount_ns() -> Result<()> {
+        // Capture real ids before unshare (inside an unmapped userns we'd read
+        // the overflow uid and write a bogus map).
         let euid = unsafe { libc::geteuid() };
         let egid = unsafe { libc::getegid() };
         set_dumpable(true);
@@ -275,26 +306,38 @@ mod linux {
         })();
         set_dumpable(false);
         ns_setup?;
+        mount_private_root()
+    }
 
-        mount_private_root()?;
-
-        // One empty file on a private tmpfs, used to mask regular files.
-        let scratch = scratch_dir("unrun")?;
+    /// Mask each existing path in `paths` with an empty overlay in the current
+    /// mount namespace: a directory gets an empty tmpfs, a regular file an
+    /// empty-file bind. `metadata` follows symlinks so we mask whatever the path
+    /// resolves to; missing/dangling/special paths are skipped. Call inside a
+    /// private namespace (see `enter_user_mount_ns`).
+    pub fn mask_paths(paths: &[PathBuf]) -> Result<()> {
+        // One empty file on a private tmpfs, reused to mask regular files.
+        let scratch = scratch_dir("mask")?;
         mount_tmpfs(&scratch)?;
         let empty = scratch.join("empty");
         std::fs::write(&empty, b"")
             .with_context(|| format!("failed to create {}", empty.display()))?;
-
-        // Mask each existing target with an empty overlay. `metadata` follows
-        // symlinks so we mask whatever the path resolves to; a missing or
-        // dangling path is already absent, so we skip it.
-        for path in hide {
+        for path in paths {
             match std::fs::metadata(path) {
                 Ok(m) if m.is_dir() => mount_tmpfs(path)?,
                 Ok(m) if m.is_file() => bind_file(&empty, path)?,
-                _ => continue, // missing, dangling, or a non-file/dir special — nothing to hide
+                _ => continue, // missing, dangling, or special — nothing to hide
             }
         }
+        Ok(())
+    }
+
+    /// Run `program` with every path in `hide` masked by an empty overlay, in a
+    /// private mount namespace. Inverse of `run`: it hides instead of reveals,
+    /// so there is no decrypt, no re-encrypt, and nothing to restore — the real
+    /// files are never touched and the namespace is discarded on exit.
+    pub fn unrun(program: &str, args: &[String], hide: &[PathBuf]) -> Result<()> {
+        enter_user_mount_ns()?;
+        mask_paths(hide)?;
 
         // Spawn the child (it inherits the namespace and every overlay). Restore
         // default signal handling in the child so Ctrl-C reaches it.
