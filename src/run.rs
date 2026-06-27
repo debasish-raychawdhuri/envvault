@@ -80,7 +80,6 @@ pub fn run(
 mod hardened {
     use super::*;
     use anyhow::{bail, Context};
-    use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::process::{CommandExt, ExitStatusExt};
     use std::path::PathBuf;
     use std::time::Duration;
@@ -101,9 +100,13 @@ mod hardened {
     }
 
     pub fn run(vault: &EnvVault, program: &str, args: &[String]) -> Result<()> {
-        // 1. Stage the shim as a 0600 file the dynamic linker can preload.
-        let shim_path = write_shim().context("failed to stage the hardening shim")?;
-        let _cleanup = FileCleanup(shim_path.clone());
+        // 1. Stage the shim in an anonymous sealed memfd (no on-disk name) and
+        //    preload it via `/proc/self/fd/<n>`. A memfd lives only in this
+        //    process's file table: there is no path an attacker can race, plant
+        //    a symlink at, or rename over — so a same-uid attacker cannot
+        //    substitute their own `.so` for the shim. Sealing prevents the
+        //    loaded image from being mutated afterward.
+        let (shim_path, memfd) = write_shim().context("failed to stage the hardening shim")?;
 
         // 2. Build the secrets payload (KEY=VALUE, NUL-separated), kept zeroized.
         let mut payload = build_payload(vault);
@@ -138,6 +141,10 @@ mod hardened {
         let spawn_result = cmd.spawn();
 
         // Close the child-side fds in the parent regardless of spawn outcome.
+        // The memfd is dropped here too: the child has inherited its own copy
+        // (no CLOEXEC), so `/proc/self/fd/<n>` keeps resolving in its namespace
+        // until ld.so has loaded the shim; the parent's copy is unneeded.
+        drop(memfd);
         unsafe {
             libc::close(ready_w);
             libc::close(secret_r);
@@ -194,25 +201,59 @@ mod hardened {
         }
     }
 
-    /// Write the embedded shim to a private (0600) file under `$XDG_RUNTIME_DIR`
-    /// (tmpfs) or the temp dir, named per-pid. Removed by `FileCleanup`.
-    fn write_shim() -> Result<PathBuf> {
-        use std::io::Write;
-        let base = std::env::var_os("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
-        let path = base.join(format!(".envvault-shim-{}.so", std::process::id()));
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&path)
-            .with_context(|| format!("failed to create {}", path.display()))?;
-        f.write_all(SHIM_SO)
-            .and_then(|_| f.sync_all())
-            .with_context(|| format!("failed to write {}", path.display()))?;
-        Ok(path)
+    /// Stage the embedded shim as a sealed `memfd_create` tmpfs file and return
+    /// a `/proc/self/fd/<n>` path the dynamic linker can preload, plus a guard
+    /// holding the fd open until the child has been spawned.
+    ///
+    /// Unlike a file on disk, a memfd has no name an attacker can race: a
+    /// same-uid process cannot substitute its own `.so` by planting a symlink
+    /// or renaming over the staging path, because no such path exists. The fd
+    /// is left inheritable (no `MFD_CLOEXEC`) so the child keeps it open across
+    /// `execve` and `/proc/self/fd/<n>` resolves in the child's namespace; we
+    /// then seal it (`WRITE | SHRINK | GROW | SEAL`) so the loaded image cannot
+    /// be modified by anyone who holds the fd. The parent drops its reference
+    /// after spawn — the child's inherited copy keeps the path valid until ld.so
+    /// has loaded the shim, and is closed automatically when the child exits.
+    fn write_shim() -> Result<(PathBuf, MemFd)> {
+        // `MFD_ALLOW_SEALING` is required to apply seals later. `MFD_CLOEXEC`
+        // is deliberately NOT set: the child must inherit the fd so the
+        // `/proc/self/fd/<n>` path resolves in its namespace after exec.
+        const MFD_ALLOW_SEALING: libc::c_uint = 0x0002;
+        let name = std::ffi::CString::new("envvault-harden").unwrap();
+        let raw = unsafe {
+            libc::syscall(
+                libc::SYS_memfd_create,
+                name.as_ptr(),
+                MFD_ALLOW_SEALING as libc::c_uint,
+            )
+        };
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("memfd_create failed (the hardening shim needs Linux 3.17+)");
+        }
+        let fd = raw as libc::c_int;
+        let guard = MemFd(fd);
+
+        write_all(fd, SHIM_SO).context("failed to write the hardening shim to the memfd")?;
+
+        // Seal the image so neither the child nor any other fd holder can
+        // rewrite, truncate, or grow it after we expose it via LD_PRELOAD.
+        // `F_SEAL_SEAL` also blocks adding further seals (or removing these).
+        let seals: libc::c_int = libc::F_SEAL_SEAL
+            | libc::F_SEAL_WRITE
+            | libc::F_SEAL_SHRINK
+            | libc::F_SEAL_GROW;
+        let rc = unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, seals as libc::c_int) };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to seal the hardening shim memfd");
+        }
+
+        // `/proc/self/fd/<n>` is a magic symlink the kernel resolves against
+        // the reader's own fd table. glibc's ld.so opens this path like any
+        // other, so it loads exactly the bytes we wrote and sealed.
+        let path = PathBuf::from(format!("/proc/self/fd/{fd}"));
+        Ok((path, guard))
     }
 
     /// Serialize the vault into `KEY=VALUE\0KEY=VALUE\0…` for the shim.
@@ -299,11 +340,18 @@ mod hardened {
         }
     }
 
-    /// Removes a staged file on drop.
-    struct FileCleanup(PathBuf);
-    impl Drop for FileCleanup {
+    /// Closes the staging memfd on drop. The parent drops its reference after
+    /// the child has been spawned; the child's inherited copy keeps
+    /// `/proc/self/fd/<n>` valid until ld.so finishes loading the shim, and is
+    /// itself closed when the child exits.
+    struct MemFd(libc::c_int);
+    impl Drop for MemFd {
         fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
+            if self.0 >= 0 {
+                unsafe {
+                    libc::close(self.0);
+                }
+            }
         }
     }
 
