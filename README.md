@@ -81,9 +81,12 @@ actually escape in practice.
   a stolen vault file expensive. New vaults use OWASP-recommended parameters
   (m=64 MiB, t=3, p=1); vaults created before this shipped use the crate
   defaults (m=19 MiB, t=2). The on-disk header carries the version
-  (`ENVVAULT v1` vs `ENVVAULT v2`), so existing vaults keep working unchanged
-  — run `envvault upgrade <name>` (or `envvault dir upgrade <name>`) to re-key
-  a legacy vault under the stronger parameters without changing its password.
+  (`ENVVAULT v1` vs `ENVVAULT v2`), so existing vaults keep working unchanged.
+  A legacy vault is **upgraded automatically the first time it is opened** (the
+  password is in hand, so it's re-keyed to v2 and re-saved once; best-effort, so
+  a read on a read-only directory still works and just stays v1). `envvault
+  upgrade <name>` / `envvault dir upgrade <name>` force it explicitly without
+  changing the password.
 - **Encryption** — ChaCha20-Poly1305, an *authenticated* cipher, with a fresh
   random 12-byte nonce on every save. Authentication means a wrong password or a
   tampered file is **detected and rejected**, not silently mis-decrypted.

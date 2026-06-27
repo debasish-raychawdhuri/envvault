@@ -298,6 +298,39 @@ mod tests {
     }
 
     #[test]
+    fn passwd_upgrades_legacy_v1_to_v2() {
+        // `cmd_passwd` mints a fresh session via `Session::create`, which is
+        // always v2. So changing the password on a legacy v1 vault must
+        // rewrite it as v2 — the format bump is a free side effect of the
+        // re-key a password change already does.
+        let dir = std::env::temp_dir().join("envvault-test-passwd-up");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pu.vault");
+
+        // A legacy v1 vault.
+        let legacy = legacy_session(b"oldpw");
+        legacy.save(&path, b"SECRET=v\n").unwrap();
+        let (opened, _) = open(&path, b"oldpw").unwrap();
+        assert!(!opened.is_current(), "fixture should be v1");
+
+        // Re-key exactly as cmd_passwd does: open with the old password,
+        // re-encrypt under a fresh (v2) session with the new password.
+        let (_old, plaintext) = open(&path, b"oldpw").unwrap();
+        let new_session = Session::create(b"newpw").unwrap();
+        new_session.save(&path, &plaintext).unwrap();
+
+        // The file is now v2, decrypts to the same contents under the new
+        // password, and the old password no longer works.
+        let (s2, pt) = open(&path, b"newpw").unwrap();
+        assert!(s2.is_current(), "passwd should have upgraded the vault to v2");
+        assert_eq!(&pt[..], b"SECRET=v\n");
+        assert!(open(&path, b"oldpw").is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn wrong_password_fails() {
         let dir = std::env::temp_dir().join("envvault-test-wp");
         std::fs::create_dir_all(&dir).unwrap();

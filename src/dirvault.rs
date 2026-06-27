@@ -128,9 +128,29 @@ pub fn create(path: &Path, password: &[u8], canonical_target: &Path) -> Result<(
 }
 
 /// Open an existing vault: decrypt and parse out the kind and target path.
+///
+/// Opportunistically upgrades a legacy (v1) vault to the current (v2) Argon2id
+/// parameters while the password is in hand. Best-effort: if the re-save fails
+/// (e.g. a read-only vault directory) we keep using the legacy session so opens
+/// never break — `dir upgrade` can retry when writable.
 pub fn open(path: &Path, password: &[u8]) -> Result<DirVault> {
-    let (session, plaintext) = crypto::open(path, password)?;
+    let (mut session, plaintext) = crypto::open(path, password)?;
     let (kind, target, _tar) = unpack(&plaintext)?;
+    if !session.is_current() {
+        match Session::create(password).and_then(|v2| v2.save(path, &plaintext).map(|()| v2)) {
+            Ok(v2) => {
+                eprintln!(
+                    "note: upgraded directory vault to v2 (Argon2id m=64 MiB, t=3); \
+                     password unchanged"
+                );
+                session = v2;
+            }
+            Err(e) => eprintln!(
+                "warning: could not upgrade directory vault to v2 ({e:#}); continuing with \
+                 legacy parameters"
+            ),
+        }
+    }
     Ok(DirVault {
         session,
         kind,

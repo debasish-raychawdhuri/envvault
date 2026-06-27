@@ -301,11 +301,41 @@ fn resolve_existing(name: &str) -> Result<std::path::PathBuf> {
 }
 
 /// Open an existing vault and parse its contents into the editable model.
+///
+/// Opportunistically upgrades a legacy (v1) vault to the current (v2) Argon2id
+/// parameters: the password is in hand here, so we re-key and re-save it once.
+/// Best-effort — if the re-save fails (e.g. a read-only directory) we keep using
+/// the legacy session so a read never breaks.
 fn open_vault(path: &Path, password_stdin: bool) -> Result<(Session, EnvVault)> {
     let pw = get_password(password_stdin)?;
     let (session, plaintext) = crypto::open(path, pw.as_bytes())?;
+    let session = auto_upgrade(session, path, pw.as_bytes(), &plaintext, "vault");
     let text = std::str::from_utf8(&plaintext).context("vault contains invalid UTF-8")?;
     Ok((session, EnvVault::parse(text)))
+}
+
+/// Best-effort re-key of a legacy (v1) session to the current (v2) Argon2id
+/// parameters, re-saving `path` with `plaintext`. Returns the session to use
+/// going forward: the new v2 session on success, or the original legacy session
+/// (with a warning) if the re-save fails, so callers never break on a read.
+/// `kind` is "vault" or "directory vault" for the messages.
+fn auto_upgrade(session: Session, path: &Path, password: &[u8], plaintext: &[u8], kind: &str) -> Session {
+    if session.is_current() {
+        return session;
+    }
+    match Session::create(password).and_then(|v2| v2.save(path, plaintext).map(|()| v2)) {
+        Ok(v2) => {
+            eprintln!("note: upgraded {kind} to v2 (Argon2id m=64 MiB, t=3); password unchanged");
+            v2
+        }
+        Err(e) => {
+            eprintln!(
+                "warning: could not upgrade {kind} to v2 ({e:#}); continuing with legacy \
+                 parameters"
+            );
+            session
+        }
+    }
 }
 
 fn cmd_init(name: &str, password_stdin: bool, no_edit: bool) -> Result<()> {
@@ -608,17 +638,23 @@ fn cmd_dir_rename(old: &str, new: &str) -> Result<()> {
 /// preserving the password. A no-op if already current.
 fn cmd_dir_upgrade(name: &str, password_stdin: bool) -> Result<()> {
     let vault_path = resolve_existing_dirvault(name)?;
+    // Note the on-disk version before opening, since `dirvault::open` upgrades a
+    // legacy vault on the way in (best-effort).
+    let was_legacy = crypto::detect_version(&vault_path)? == 1;
     let pw = get_password(password_stdin)?;
     let dv = dirvault::open(&vault_path, pw.as_bytes())?;
     if dv.is_current() {
-        println!(
-            "directory vault '{name}' is already using the current Argon2id parameters (v2); nothing to do"
-        );
+        let msg = if was_legacy {
+            format!("Upgraded directory vault '{name}' to v2 (Argon2id m=64 MiB, t=3). The password is unchanged.")
+        } else {
+            format!("directory vault '{name}' is already using the current Argon2id parameters (v2); nothing to do")
+        };
+        println!("{msg}");
         return Ok(());
     }
-    // Re-key the inner container under a fresh v2 session, same password.
-    // The container's plaintext (magic + kind + path + tar) is unchanged, so
-    // the target path and kind are preserved exactly.
+    // Open's best-effort upgrade couldn't write; do it explicitly so the failure
+    // surfaces as an error on this explicit request. The container plaintext
+    // (magic + kind + path + tar) is unchanged, so target and kind are preserved.
     let new_session = Session::create(pw.as_bytes())?;
     new_session.save(&vault_path, dv.plaintext())?;
     println!(
