@@ -61,7 +61,11 @@ that actually needs them.
   password the file is useless — safe to back up, sync, even commit.
 - **In use**, the secret exists only in `envvault`'s memory (wiped on exit) and
   in the environment of the single child process you launched. It is never
-  exported into your interactive shell, so nothing else inherits it.
+  exported into your interactive shell, so nothing else inherits it. (For
+  `run`, that one child's environment is still readable by a same-uid process
+  via `/proc/<pid>/environ` — an inherent limit of env injection. When a tool
+  can read its secret from a *file*, `dir run` removes even that exposure; see
+  [`run` vs `dir run`](#run-vs-dir-run-keeping-secrets-off-the-environment).)
 - **Nothing transient leaks**: no plaintext temp file, no shell-history line, no
   clipboard copy. You type a password, the program runs, the secret is gone.
 
@@ -322,6 +326,41 @@ read. See the caveat about clipboard managers under *Security notes* below.
 
 ---
 
+## `run` vs `dir run`: keeping secrets off the environment
+
+`envvault run` is the convenient fallback, but it is the **weaker** of the two
+modes, and deliberately so — there is no way to make it stronger. It decrypts
+the secrets and `exec`s your program with them in its **environment**. From that
+moment until the program exits, any process running as you can read them from
+`/proc/<pid>/environ`.
+
+This is **inherent to env injection, not a bug we can fix.** You might hope
+envvault could mark the program non-dumpable (`prctl(PR_SET_DUMPABLE, 0)`, which
+*does* block `/proc/<pid>/environ` reads) — but a normal `execve` resets the
+dumpable bit back to "dumpable" for any ordinary program, and envvault can't
+stop the target's own exec from doing that. The secret is exposed for the
+program's whole lifetime to exactly the same-uid attacker envvault exists to
+resist. `run` prints a one-line reminder of this on each use (silence it with
+`--quiet` or `ENVVAULT_QUIET=1`).
+
+**So prefer `dir run` whenever the tool can read its secret from a file** — there
+the plaintext lives only on a namespace-private tmpfs and never enters any
+environment. Two patterns cover almost everything:
+
+- **The tool reads a config file directly** (Claude Code's `~/.claude`, the AWS
+  CLI's `~/.aws/credentials`, opencode's `auth.json`): vault that file or
+  directory and use `dir run` — see the next section.
+- **The tool takes a *file path* in an env var** (only a non-secret path is
+  exposed, never the secret itself). Many tools support this convention:
+  `GOOGLE_APPLICATION_CREDENTIALS`, `AWS_SHARED_CREDENTIALS_FILE`, `KUBECONFIG`,
+  and assorted `*_TOKEN_FILE` / `*_PASSWORD_FILE` variables. Vault the file, and
+  let the (harmless) path travel in the environment.
+
+Reach for `run` only when a program accepts its secret **exclusively** as an
+environment-variable value — and do so knowing the exposure above.
+
+---
+
 ## Directory & file vaults: keep a tool's secrets encrypted at rest
 
 Some tools insist on writing secrets to disk rather than reading them from the
@@ -387,9 +426,14 @@ writing plaintext to real disk.
   suggestions. It's advisory: a weak password is reported, never rejected.
 - `show` and the editor's "reveal" deliberately display secrets on screen — use
   them intentionally.
-- Once a secret is handed to a child process it lives in that child's
-  environment like any other variable; `envvault` only controls how it gets
-  there, not what the program does with it afterward.
+- **`run` (env injection) cannot be secured against a same-uid attacker.** Once
+  a secret is handed to a child via its environment it is readable through
+  `/proc/<pid>/environ` for that program's whole lifetime, and there is no fix:
+  a normal `execve` resets the child's dumpable bit, so it can't be hidden the
+  way `envvault` hides itself. `envvault` only controls how the secret gets
+  there, not what the program does with it afterward. Prefer `dir run` for
+  file-based secrets — see
+  [`run` vs `dir run`](#run-vs-dir-run-keeping-secrets-off-the-environment).
 - `envvault` protects secrets *at rest* and limits their *exposure at runtime*.
   Marking the process non-dumpable stops a *same-user* attacker from core-dumping
   or debugging **the `envvault` process** to read its memory, but it does not make

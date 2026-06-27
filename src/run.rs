@@ -10,7 +10,22 @@ use std::process::Command;
 /// environment. On unix this replaces the current process (exec) so the
 /// process tree stays clean and signals pass straight through; on other
 /// platforms it spawns a child and propagates its exit code.
-pub fn run(vault: &EnvVault, program: &str, args: &[String]) -> Result<()> {
+///
+/// Unless `quiet`, a one-time caution is printed to stderr first: secrets handed
+/// to a program via its environment are readable by any same-uid process through
+/// `/proc/<pid>/environ` for the program's lifetime, and this is inherent to env
+/// injection (a child's own `exec` resets its dumpable bit, so it can't be
+/// hidden). For tools that can read a secret from a file, `dir run` avoids this.
+pub fn run(vault: &EnvVault, program: &str, args: &[String], quiet: bool) -> Result<()> {
+    if !quiet {
+        eprintln!(
+            "note: 'run' places these secrets in the program's environment; any process\n      \
+             running as you can read them via /proc/<pid>/environ while it runs.\n      \
+             For tools that read a secret from a file, prefer 'envvault dir run'.\n      \
+             (silence: --quiet or ENVVAULT_QUIET=1)"
+        );
+    }
+
     let mut cmd = Command::new(program);
     cmd.args(args);
     for e in vault.entries() {
