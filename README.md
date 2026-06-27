@@ -280,6 +280,7 @@ envvault show work
 | `passwd <name>`          | Change the vault's password (verifies the old one, re-encrypts under the new). |
 | `run <name> -- <cmd>…`   | Decrypt in memory and run `<cmd>` with the secrets in its environment. |
 | `set <name> KEY …`       | Add/update keys; each value entered at a no-echo prompt, then the clipboard is wiped. |
+| `rename <old> <new>`     | Rename a vault. |
 | `rm <name> KEY …`        | Remove one or more keys. |
 | `show <name>`            | Print decrypted `KEY=VALUE` lines to stdout. |
 
@@ -361,6 +362,7 @@ writing plaintext to real disk.
 | `dir run <name> -- <cmd>…`     | Decrypt into RAM at the original path, run `<cmd>`, re-encrypt on changes and on exit. |
 | `dir list`                     | List all directory vaults. |
 | `dir status <name>`            | Print the vault's stored target path. |
+| `dir rename <old> <new>`       | Rename a directory/file vault. |
 | `dir export <name> --to <dir>` | Decrypt the contents into `<dir>` (writes plaintext to disk!). |
 | `dir rm <name>`                | Delete the vault file. |
 

@@ -57,6 +57,11 @@ enum Cmd {
     Passwd {
         name: String,
     },
+    /// Rename a vault.
+    Rename {
+        old: String,
+        new: String,
+    },
     /// Decrypt in memory and run a program with the vault's secrets in its env.
     Run {
         name: String,
@@ -147,6 +152,11 @@ enum DirCmd {
         #[arg(long)]
         password_stdin: bool,
     },
+    /// Rename a directory vault.
+    Rename {
+        old: String,
+        new: String,
+    },
     /// Delete a directory vault file (its encrypted contents are lost).
     Rm {
         name: String,
@@ -175,6 +185,7 @@ fn run_cli() -> Result<()> {
             password_stdin,
         } => cmd_edit(&name, password_stdin),
         Cmd::Passwd { name } => cmd_passwd(&name),
+        Cmd::Rename { old, new } => cmd_rename(&old, &new),
         Cmd::Run {
             name,
             password_stdin,
@@ -220,6 +231,7 @@ fn run_dir(command: DirCmd) -> Result<()> {
             to,
             password_stdin,
         } => cmd_dir_export(&name, &to, password_stdin),
+        DirCmd::Rename { old, new } => cmd_dir_rename(&old, &new),
         DirCmd::Rm { name } => cmd_dir_rm(&name),
     }
 }
@@ -297,6 +309,18 @@ fn cmd_passwd(name: &str) -> Result<()> {
     let new_session = Session::create(new_pw.as_bytes())?;
     new_session.save(&path, &plaintext)?;
     println!("Password changed for vault '{name}'");
+    Ok(())
+}
+
+fn cmd_rename(old: &str, new: &str) -> Result<()> {
+    let old_path = resolve_existing(old)?;
+    let new_path = store::vault_path(new)?; // also validates the new name
+    if new_path.exists() {
+        bail!("a vault named '{new}' already exists — refusing to overwrite");
+    }
+    std::fs::rename(&old_path, &new_path)
+        .with_context(|| format!("failed to rename vault '{old}' to '{new}'"))?;
+    println!("Renamed vault '{old}' to '{new}'");
     Ok(())
 }
 
@@ -456,7 +480,11 @@ fn cmd_dir_status(name: &str, password_stdin: bool) -> Result<()> {
     let vault_path = resolve_existing_dirvault(name)?;
     let pw = get_password(password_stdin)?;
     let dv = dirvault::open(&vault_path, pw.as_bytes())?;
-    println!("{name}: target directory {}", dv.target().display());
+    let kind = match dv.kind() {
+        dirvault::Kind::Dir => "directory",
+        dirvault::Kind::File => "file",
+    };
+    println!("{name}: {kind} {}", dv.target().display());
     Ok(())
 }
 
@@ -472,6 +500,18 @@ fn cmd_dir_export(name: &str, to: &str, password_stdin: bool) -> Result<()> {
         "Exported '{name}' to {} (WARNING: this wrote the decrypted contents to disk).",
         dest.display()
     );
+    Ok(())
+}
+
+fn cmd_dir_rename(old: &str, new: &str) -> Result<()> {
+    let old_path = resolve_existing_dirvault(old)?;
+    let new_path = store::dirvault_path(new)?; // also validates the new name
+    if new_path.exists() {
+        bail!("a directory vault named '{new}' already exists — refusing to overwrite");
+    }
+    std::fs::rename(&old_path, &new_path)
+        .with_context(|| format!("failed to rename directory vault '{old}' to '{new}'"))?;
+    println!("Renamed directory vault '{old}' to '{new}'");
     Ok(())
 }
 
