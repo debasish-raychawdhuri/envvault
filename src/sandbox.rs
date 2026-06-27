@@ -36,12 +36,13 @@ pub fn run<F>(
     program: &str,
     args: &[String],
     autosave: Option<Duration>,
+    harden: bool,
     open: F,
 ) -> Result<()>
 where
     F: FnOnce() -> Result<DirVault>,
 {
-    linux::run(vault_path, program, args, autosave, open)
+    linux::run(vault_path, program, args, autosave, harden, open)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -50,6 +51,7 @@ pub fn run<F>(
     _program: &str,
     _args: &[String],
     _autosave: Option<Duration>,
+    _harden: bool,
     _open: F,
 ) -> Result<()>
 where
@@ -115,6 +117,7 @@ pub fn mask_paths(_paths: &[std::path::PathBuf]) -> Result<()> {
 mod linux {
     use super::*;
     use crate::dirvault::Kind;
+    use crate::shim;
     use anyhow::Context;
     use std::collections::hash_map::DefaultHasher;
     use std::ffi::CString;
@@ -135,6 +138,7 @@ mod linux {
         program: &str,
         args: &[String],
         autosave: Option<Duration>,
+        harden: bool,
         open: F,
     ) -> Result<()>
     where
@@ -243,19 +247,61 @@ mod linux {
         // 7. Spawn the child (it inherits the namespace and the tmpfs view).
         let mut cmd = Command::new(program);
         cmd.args(args);
+
+        // 7a. With `--harden`, preload the shim in non-dumpable-only mode so the
+        //     program (and the secret it reads from the in-RAM file) can't be
+        //     core-dumped / ptraced by a same-uid attacker. Best-effort: the
+        //     secret reaches the program via the file regardless, so a failed
+        //     preload only means "still dumpable" — we warn rather than abort.
+        let mut memfd_guard: Option<shim::MemFd> = None;
+        let mut ready_pipe: Option<(libc::c_int, libc::c_int)> = None; // (read, write)
+        if harden {
+            let (shim_path, memfd) =
+                shim::stage_shim().context("failed to stage the hardening shim")?;
+            let (ready_r, ready_w) = shim::pipe().context("pipe() failed")?;
+            cmd.env("LD_PRELOAD", &shim_path);
+            cmd.env("ENVVAULT_NODUMP", "1");
+            cmd.env("ENVVAULT_READY_FD", ready_w.to_string());
+            memfd_guard = Some(memfd);
+            ready_pipe = Some((ready_r, ready_w));
+        }
+
+        let child_close = ready_pipe.map(|(r, _)| r); // parent's read end, closed in the child
         unsafe {
-            cmd.pre_exec(|| {
+            cmd.pre_exec(move || {
+                if let Some(fd) = child_close {
+                    libc::close(fd);
+                }
                 for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
                     libc::signal(sig, libc::SIG_DFL);
                 }
                 Ok(())
             });
         }
-        let status = cmd
+        let mut child = cmd
             .spawn()
-            .with_context(|| format!("failed to execute '{program}'"))?
-            .wait()
-            .context("failed waiting for child process")?;
+            .with_context(|| format!("failed to execute '{program}'"))?;
+
+        // 7b. If hardening, verify the shim actually loaded (best-effort warn),
+        //     then drop the parent's shim fds.
+        if let Some((ready_r, ready_w)) = ready_pipe {
+            drop(memfd_guard.take()); // the child holds its own inherited copy
+            unsafe {
+                libc::close(ready_w);
+            }
+            if !shim::wait_for_ready(ready_r, shim::ready_timeout()) {
+                eprintln!(
+                    "warning: '{program}' did not load the hardening shim; its memory (and the \
+                     decrypted secrets it holds) is core-dumpable by a same-uid process — likely \
+                     a static or setuid binary, or LD_PRELOAD was ignored."
+                );
+            }
+            unsafe {
+                libc::close(ready_r);
+            }
+        }
+
+        let status = child.wait().context("failed waiting for child process")?;
 
         // 8. The child is gone; restore default signal handling so the final
         //    re-encrypt below is interruptible with Ctrl-C if it ever hangs

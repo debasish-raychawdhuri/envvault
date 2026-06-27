@@ -493,13 +493,29 @@ writing plaintext to real disk.
 | Command | What it does |
 |---------|--------------|
 | `dir init <name> --path <path>` | Encrypt a directory **or a single file** into a vault, then empty it. |
-| `dir run <name> -- <cmd>…`     | Decrypt into RAM at the original path, run `<cmd>`, re-encrypt on changes and on exit. |
+| `dir run <name> -- <cmd>…`     | Decrypt into RAM at the original path, run `<cmd>`, re-encrypt on changes and on exit. `--harden` marks `<cmd>` non-dumpable. |
 | `dir list`                     | List all directory vaults. |
 | `dir status <name>`            | Print the vault's stored target path. |
 | `dir rename <old> <new>`       | Rename a directory/file vault. |
 | `dir upgrade <name>`           | Re-encrypt under the current Argon2id parameters (no-op if already current). |
 | `dir export <name> --to <dir>` | Decrypt the contents into `<dir>` (writes plaintext to disk!). |
 | `dir rm <name>`                | Delete the vault file. |
+
+### `dir run --harden`: stop the program itself being core-dumped
+
+`dir run` keeps the secret in RAM and hides it from the host, but the program
+reading it (opencode, claude, …) holds the plaintext in *its own* memory. Other
+processes in the host can't reach it — `dir run` runs the program in a private
+user namespace, so a same-uid attacker outside can't `ptrace`/core-dump it across
+the namespace boundary. **But the untested code the program itself spawns** (a
+plugin, a build step) runs as the program's own child in the *same* namespace,
+and could `gcore`/`ptrace` its parent to lift the key.
+
+`dir run --harden` closes that: it preloads a shim that marks the program
+**non-dumpable** before it runs, so even its own children can't dump it. Same
+mechanism and limits as `run --harden` (dynamically-linked programs only;
+best-effort — it **warns** if the shim can't load rather than failing, since the
+secret reaches the program via the file regardless).
 
 ---
 

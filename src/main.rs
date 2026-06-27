@@ -11,6 +11,7 @@ mod harden;
 mod password;
 mod run;
 mod sandbox;
+mod shim;
 mod store;
 mod tui;
 mod vault;
@@ -173,6 +174,11 @@ enum DirCmd {
         /// Seconds the directory must be unchanged before an autosave fires.
         #[arg(long, default_value_t = 2)]
         autosave_debounce: u64,
+        /// Preload a shim that marks the program non-dumpable, so a same-uid
+        /// process can't core-dump/ptrace it to read the decrypted secret out of
+        /// its memory. Best-effort (warns if the shim can't load); Linux only.
+        #[arg(long)]
+        harden: bool,
         /// The program to run, followed by its arguments (use `--` first).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true, num_args = 1..)]
         command: Vec<String>,
@@ -277,8 +283,16 @@ fn run_dir(command: DirCmd) -> Result<()> {
             password_stdin,
             no_autosave,
             autosave_debounce,
+            harden,
             command,
-        } => cmd_dir_run(&name, password_stdin, no_autosave, autosave_debounce, &command),
+        } => cmd_dir_run(
+            &name,
+            password_stdin,
+            no_autosave,
+            autosave_debounce,
+            harden,
+            &command,
+        ),
         DirCmd::List => cmd_dir_list(),
         DirCmd::Status {
             name,
@@ -733,6 +747,7 @@ fn cmd_dir_run(
     password_stdin: bool,
     no_autosave: bool,
     autosave_debounce: u64,
+    harden: bool,
     command: &[String],
 ) -> Result<()> {
     let vault_path = resolve_existing_dirvault(name)?;
@@ -747,7 +762,7 @@ fn cmd_dir_run(
     // The vault is opened (password prompt + decrypt) by this closure, which
     // `sandbox::run` calls only after setting up the namespace and re-hardening
     // the process — so no secret exists during the brief dumpable window.
-    sandbox::run(&vault_path, program, args, autosave, || {
+    sandbox::run(&vault_path, program, args, autosave, harden, || {
         let pw = get_password(password_stdin)?;
         dirvault::open(&vault_path, pw.as_bytes())
     })

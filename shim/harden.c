@@ -47,6 +47,24 @@ static void envvault_harden(void)
 {
     int ready_fd = fd_from_env("ENVVAULT_READY_FD");
     int secret_fd = fd_from_env("ENVVAULT_SECRET_FD");
+
+    /* Non-dumpable-only mode (`dir run --harden`): the secret comes from a file,
+     * not over a pipe, so there is nothing to inject — just make this process
+     * non-dumpable (blocking same-uid core dumps / ptrace / /proc/<pid>/mem) and
+     * tell the parent it took, so it can warn if the preload was ignored. */
+    if (getenv("ENVVAULT_NODUMP") != NULL && secret_fd < 0) {
+        (void)prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+        if (ready_fd >= 0) {
+            char ok = 'R';
+            (void)write(ready_fd, &ok, 1);
+            close(ready_fd);
+        }
+        unsetenv("ENVVAULT_NODUMP");
+        unsetenv("ENVVAULT_READY_FD");
+        unsetenv("LD_PRELOAD");
+        return;
+    }
+
     if (ready_fd < 0 || secret_fd < 0) {
         return; /* not a hardened run */
     }
