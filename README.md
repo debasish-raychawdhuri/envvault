@@ -78,7 +78,12 @@ actually escape in practice.
 
 - **Key derivation** — Argon2id (a memory-hard KDF) turns your password plus a
   per-vault random 16-byte salt into a 32-byte key. Argon2id makes brute-forcing
-  a stolen vault file expensive.
+  a stolen vault file expensive. New vaults use OWASP-recommended parameters
+  (m=64 MiB, t=3, p=1); vaults created before this shipped use the crate
+  defaults (m=19 MiB, t=2). The on-disk header carries the version
+  (`ENVVAULT v1` vs `ENVVAULT v2`), so existing vaults keep working unchanged
+  — run `envvault upgrade <name>` (or `envvault dir upgrade <name>`) to re-key
+  a legacy vault under the stronger parameters without changing its password.
 - **Encryption** — ChaCha20-Poly1305, an *authenticated* cipher, with a fresh
   random 12-byte nonce on every save. Authentication means a wrong password or a
   tampered file is **detected and rejected**, not silently mis-decrypted.
@@ -266,6 +271,10 @@ envvault edit work
 # Change a vault's password (asks for the current one, then the new one twice)
 envvault passwd work
 
+# Re-encrypt a vault under the stronger current Argon2id parameters (no-op if
+# already current). The password is unchanged.
+envvault upgrade work
+
 # Run a program with the vault's variables in its environment
 envvault run work -- python train.py
 envvault run work -- bash -lc 'echo $OPENAI_API_KEY'
@@ -290,6 +299,7 @@ envvault show work
 | `list`                   | List all vaults in the vault directory. |
 | `edit <name>`            | Open the interactive TUI to manage secrets. |
 | `passwd <name>`          | Change the vault's password (verifies the old one, re-encrypts under the new). |
+| `upgrade <name>`         | Re-encrypt under the current Argon2id parameters (no-op if already current). |
 | `run <name> -- <cmd>…`   | Decrypt in memory and run `<cmd>` with the secrets in its environment. |
 | `set <name> KEY …`       | Add/update keys; each value entered at a no-echo prompt, then the clipboard is wiped. |
 | `rename <old> <new>`     | Rename a vault. |
@@ -474,6 +484,7 @@ writing plaintext to real disk.
 | `dir list`                     | List all directory vaults. |
 | `dir status <name>`            | Print the vault's stored target path. |
 | `dir rename <old> <new>`       | Rename a directory/file vault. |
+| `dir upgrade <name>`           | Re-encrypt under the current Argon2id parameters (no-op if already current). |
 | `dir export <name> --to <dir>` | Decrypt the contents into `<dir>` (writes plaintext to disk!). |
 | `dir rm <name>`                | Delete the vault file. |
 

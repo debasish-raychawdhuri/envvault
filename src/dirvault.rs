@@ -150,6 +150,19 @@ impl DirVault {
         self.kind
     }
 
+    /// Whether the underlying crypto session uses the current (v2) Argon2id
+    /// parameters. A `false` result means the vault was created under the
+    /// legacy v1 defaults and can be re-keyed with `dir upgrade`.
+    pub fn is_current(&self) -> bool {
+        self.session.is_current()
+    }
+
+    /// The decrypted container plaintext (magic + kind + path + tar), wiped on
+    /// drop. Used by `dir upgrade` to re-encrypt under a fresh v2 session.
+    pub fn plaintext(&self) -> &[u8] {
+        &self.plaintext
+    }
+
     /// Extract the archived contents into `dest`, preserving modes and symlinks.
     /// For a directory vault the tree lands directly under `dest`; for a file
     /// vault the single file lands at `dest/<basename>`. The `tar` crate rejects

@@ -57,6 +57,18 @@ enum Cmd {
     Passwd {
         name: String,
     },
+    /// Re-encrypt a vault under the current (stronger) Argon2id parameters.
+    ///
+    /// Vaults created before stronger key-derivation shipped use a legacy
+    /// format (v1, Argon2id defaults: m=19 MiB, t=2). This command decrypts
+    /// with the existing password and re-encrypts the same contents under a
+    /// fresh v2 session (m=64 MiB, t=3) — without changing the password.
+    /// No-op (and reports as such) if the vault is already current.
+    Upgrade {
+        name: String,
+        #[arg(long)]
+        password_stdin: bool,
+    },
     /// Rename a vault.
     Rename {
         old: String,
@@ -166,6 +178,13 @@ enum DirCmd {
         old: String,
         new: String,
     },
+    /// Re-encrypt a directory vault under the current (stronger) Argon2id
+    /// parameters, preserving the password. No-op if already current.
+    Upgrade {
+        name: String,
+        #[arg(long)]
+        password_stdin: bool,
+    },
     /// Delete a directory vault file (its encrypted contents are lost).
     Rm {
         name: String,
@@ -194,6 +213,10 @@ fn run_cli() -> Result<()> {
             password_stdin,
         } => cmd_edit(&name, password_stdin),
         Cmd::Passwd { name } => cmd_passwd(&name),
+        Cmd::Upgrade {
+            name,
+            password_stdin,
+        } => cmd_upgrade(&name, password_stdin),
         Cmd::Rename { old, new } => cmd_rename(&old, &new),
         Cmd::Run {
             name,
@@ -243,6 +266,10 @@ fn run_dir(command: DirCmd) -> Result<()> {
             password_stdin,
         } => cmd_dir_export(&name, &to, password_stdin),
         DirCmd::Rename { old, new } => cmd_dir_rename(&old, &new),
+        DirCmd::Upgrade {
+            name,
+            password_stdin,
+        } => cmd_dir_upgrade(&name, password_stdin),
         DirCmd::Rm { name } => cmd_dir_rm(&name),
     }
 }
@@ -313,13 +340,46 @@ fn cmd_passwd(name: &str) -> Result<()> {
     let path = resolve_existing(name)?;
     // Verify the current password by actually decrypting with it.
     let old_pw = password::prompt("Current vault password: ")?;
-    let (_old_session, plaintext) = crypto::open(&path, old_pw.as_bytes())?;
+    let (old_session, plaintext) = crypto::open(&path, old_pw.as_bytes())?;
     // Acquire and confirm the new password, then re-encrypt the same contents
     // under a fresh salt + key (Session::create generates a new salt).
     let new_pw = password::prompt_new()?;
     let new_session = Session::create(new_pw.as_bytes())?;
     new_session.save(&path, &plaintext)?;
-    println!("Password changed for vault '{name}'");
+    // `Session::create` always uses the current (v2) Argon2id parameters, so
+    // a password change on a legacy v1 vault re-keys it to v2 as a free side
+    // effect — surface that so the format change isn't silent.
+    if !old_session.is_current() {
+        println!(
+            "Password changed for vault '{name}' (also upgraded to v2 Argon2id parameters)."
+        );
+    } else {
+        println!("Password changed for vault '{name}'");
+    }
+    Ok(())
+}
+
+/// Re-encrypt a vault under the current (v2) Argon2id parameters, preserving
+/// the password. Decrypts with the file's existing parameters (v1 or v2), then
+/// mints a fresh v2 session (new salt + stronger KDF) and re-encrypts the same
+/// plaintext. A no-op if the vault is already current.
+fn cmd_upgrade(name: &str, password_stdin: bool) -> Result<()> {
+    let path = resolve_existing(name)?;
+    let pw = get_password(password_stdin)?;
+    let (session, plaintext) = crypto::open(&path, pw.as_bytes())?;
+    if session.is_current() {
+        println!(
+            "vault '{name}' is already using the current Argon2id parameters (v2); nothing to do"
+        );
+        return Ok(());
+    }
+    // Mint a fresh v2 session with a new salt under the same password and
+    // re-encrypt. `Session::create` always uses the current parameters.
+    let new_session = Session::create(pw.as_bytes())?;
+    new_session.save(&path, &plaintext)?;
+    println!(
+        "Upgraded vault '{name}' to v2 (Argon2id m=64 MiB, t=3). The password is unchanged."
+    );
     Ok(())
 }
 
@@ -483,13 +543,24 @@ fn cmd_dir_run(
 }
 
 fn cmd_dir_list() -> Result<()> {
-    let vaults = store::list_dirvaults()?;
-    if vaults.is_empty() {
+    let names = store::list_dirvaults()?;
+    if names.is_empty() {
         println!("No directory vaults yet. Create one with `envvault dir init <name> --path <dir>`.");
-    } else {
-        for name in vaults {
-            println!("{name}");
-        }
+        return Ok(());
+    }
+    let mut rows: Vec<(String, &'static str)> = Vec::with_capacity(names.len());
+    for name in &names {
+        let path = store::dirvault_path(name)?;
+        let tier = match crypto::detect_version(&path) {
+            Ok(2) => "v2",
+            Ok(1) => "v1 (legacy — `envvault dir upgrade {name}`)",
+            _ => "?",
+        };
+        rows.push((name.clone(), tier));
+    }
+    let width = rows.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
+    for (name, tier) in rows {
+        println!("{name:<width$}  {tier}");
     }
     Ok(())
 }
@@ -530,6 +601,29 @@ fn cmd_dir_rename(old: &str, new: &str) -> Result<()> {
     std::fs::rename(&old_path, &new_path)
         .with_context(|| format!("failed to rename directory vault '{old}' to '{new}'"))?;
     println!("Renamed directory vault '{old}' to '{new}'");
+    Ok(())
+}
+
+/// Re-encrypt a directory vault under the current (v2) Argon2id parameters,
+/// preserving the password. A no-op if already current.
+fn cmd_dir_upgrade(name: &str, password_stdin: bool) -> Result<()> {
+    let vault_path = resolve_existing_dirvault(name)?;
+    let pw = get_password(password_stdin)?;
+    let dv = dirvault::open(&vault_path, pw.as_bytes())?;
+    if dv.is_current() {
+        println!(
+            "directory vault '{name}' is already using the current Argon2id parameters (v2); nothing to do"
+        );
+        return Ok(());
+    }
+    // Re-key the inner container under a fresh v2 session, same password.
+    // The container's plaintext (magic + kind + path + tar) is unchanged, so
+    // the target path and kind are preserved exactly.
+    let new_session = Session::create(pw.as_bytes())?;
+    new_session.save(&vault_path, dv.plaintext())?;
+    println!(
+        "Upgraded directory vault '{name}' to v2 (Argon2id m=64 MiB, t=3). The password is unchanged."
+    );
     Ok(())
 }
 
@@ -599,16 +693,30 @@ fn cmd_show(name: &str, password_stdin: bool) -> Result<()> {
 }
 
 fn cmd_list() -> Result<()> {
-    let vaults = store::list_vaults()?;
-    if vaults.is_empty() {
+    let names = store::list_vaults()?;
+    if names.is_empty() {
         println!(
             "No vaults yet in {}. Create one with `envvault init <name>`.",
             store::vault_dir()?.display()
         );
-    } else {
-        for name in vaults {
-            println!("{name}");
-        }
+        return Ok(());
+    }
+    // Read each vault's on-disk header (no password needed) to show its KDF
+    // tier: v2 = current Argon2id (m=64 MiB, t=3), v1 = legacy defaults
+    // (m=19 MiB, t=2). A vault that fails to parse is shown as `?`.
+    let mut rows: Vec<(String, &'static str)> = Vec::with_capacity(names.len());
+    for name in &names {
+        let path = store::vault_path(name)?;
+        let tier = match crypto::detect_version(&path) {
+            Ok(2) => "v2",
+            Ok(1) => "v1 (legacy — `envvault upgrade {name}`)",
+            _ => "?",
+        };
+        rows.push((name.clone(), tier));
+    }
+    let width = rows.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
+    for (name, tier) in rows {
+        println!("{name:<width$}  {tier}");
     }
     Ok(())
 }

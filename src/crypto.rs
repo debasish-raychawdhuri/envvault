@@ -5,12 +5,19 @@
 //!
 //! On-disk format (UTF-8 text, git/copy-paste friendly):
 //! ```text
-//! ENVVAULT v1
+//! ENVVAULT v<N>
 //! <base64( salt[16] || nonce[12] || ciphertext+tag )>
 //! ```
+//!
+//! Version `v1` (legacy) derives the key with `Argon2::default()` parameters
+//! (m=19456 KiB, t=2, p=1) — the crate's original settings. Version `v2`
+//! (current) uses stronger parameters (m=65536 KiB / 64 MiB, t=3, p=1),
+//! aligned with OWASP's "recommended" Argon2id tier. The version is stored in
+//! the header so `open` knows which parameters to use; an `upgrade` command
+//! re-encrypts a v1 vault under v2 without changing the password.
 
 use anyhow::{anyhow, bail, Context, Result};
-use argon2::Argon2;
+use argon2::{Algorithm, Argon2, Params, Version};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use chacha20poly1305::aead::Aead;
@@ -18,10 +25,39 @@ use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 use std::path::Path;
 use zeroize::Zeroizing;
 
-const MAGIC: &str = "ENVVAULT v1";
+/// Legacy format: Argon2id with the crate defaults (m=19456 KiB, t=2, p=1).
+const MAGIC_V1: &str = "ENVVAULT v1";
+/// Current format: Argon2id with OWASP-recommended parameters (m=64 MiB, t=3,
+/// p=1). New vaults are created at this version; `upgrade` re-encrypts v1
+/// vaults into this format.
+const MAGIC_V2: &str = "ENVVAULT v2";
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
 const KEY_LEN: usize = 32;
+
+/// Argon2id parameters for the current (v2) format. m=65536 KiB (64 MiB) makes
+/// brute-forcing a stolen vault file substantially more expensive than the
+/// legacy defaults, at the cost of ~60–100 ms per open (acceptable for a
+/// per-command interactive tool).
+const V2_M_COST: u32 = 65536;
+const V2_T_COST: u32 = 3;
+const V2_P_COST: u32 = 1;
+
+/// The Argon2id instance used to derive keys for new (v2) vaults.
+fn argon2_current() -> Argon2<'static> {
+    let params = Params::new(V2_M_COST, V2_T_COST, V2_P_COST, Some(KEY_LEN))
+        .expect("hardcoded Argon2id parameters are valid");
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+}
+
+/// Pick the Argon2id instance matching a vault's on-disk version.
+fn argon2_for_version(version: u8) -> Result<Argon2<'static>> {
+    match version {
+        1 => Ok(Argon2::default()),
+        2 => Ok(argon2_current()),
+        other => bail!("unsupported vault format version v{other}"),
+    }
+}
 
 /// Fill an array with cryptographically secure random bytes.
 fn random_array<const N: usize>() -> Result<[u8; N]> {
@@ -30,10 +66,11 @@ fn random_array<const N: usize>() -> Result<[u8; N]> {
     Ok(buf)
 }
 
-/// Derive a 32-byte key from a password and salt using Argon2id.
-fn derive_key(password: &[u8], salt: &[u8]) -> Result<Zeroizing<[u8; KEY_LEN]>> {
+/// Derive a 32-byte key from a password and salt using the given Argon2id
+/// instance.
+fn derive_key(password: &[u8], salt: &[u8], argon: &Argon2<'_>) -> Result<Zeroizing<[u8; KEY_LEN]>> {
     let mut key = Zeroizing::new([0u8; KEY_LEN]);
-    Argon2::default()
+    argon
         .hash_password_into(password, salt, key.as_mut())
         .map_err(|e| anyhow!("key derivation failed: {e}"))?;
     Ok(key)
@@ -45,14 +82,29 @@ fn derive_key(password: &[u8], salt: &[u8]) -> Result<Zeroizing<[u8; KEY_LEN]>> 
 pub struct Session {
     salt: [u8; SALT_LEN],
     key: Zeroizing<[u8; KEY_LEN]>,
+    /// On-disk format version this session reads/writes (1 = legacy, 2 =
+    /// current). New sessions are always v2; a v1 session is only produced by
+    /// `open`ing an existing legacy vault (and is preserved across re-saves
+    /// until an `upgrade` or `passwd` re-keys it as v2).
+    version: u8,
 }
 
 impl Session {
-    /// Create a brand-new vault session with a freshly generated salt.
+    /// Create a brand-new vault session with a freshly generated salt and the
+    /// current (v2) Argon2id parameters.
     pub fn create(password: &[u8]) -> Result<Self> {
         let salt = random_array::<SALT_LEN>()?;
-        let key = derive_key(password, &salt)?;
-        Ok(Self { salt, key })
+        let key = derive_key(password, &salt, &argon2_current())?;
+        Ok(Self {
+            salt,
+            key,
+            version: 2,
+        })
+    }
+
+    /// Whether this session uses the current (v2) Argon2id parameters.
+    pub fn is_current(&self) -> bool {
+        self.version == 2
     }
 
     /// Encrypt `plaintext` and return the full armored file body as a String.
@@ -69,7 +121,12 @@ impl Session {
         blob.extend_from_slice(&nonce_bytes);
         blob.extend_from_slice(&ciphertext);
 
-        Ok(format!("{MAGIC}\n{}\n", B64.encode(&blob)))
+        let magic = match self.version {
+            1 => MAGIC_V1,
+            2 => MAGIC_V2,
+            other => bail!("unsupported session version {other}"),
+        };
+        Ok(format!("{magic}\n{}\n", B64.encode(&blob)))
     }
 
     /// Encrypt and durably write the vault to `path` with 0600 permissions.
@@ -100,10 +157,18 @@ impl Session {
     /// Decrypt a vault file using *this* session's key (no password re-prompt).
     /// Used to verify a freshly written file before committing it. The salt
     /// stored in the file must match the session's, or the file isn't ours.
+    /// The on-disk version must also match: a v1 session only verifies a v1
+    /// file, and a v2 session only verifies a v2 file.
     fn decrypt_file(&self, path: &Path) -> Result<Zeroizing<Vec<u8>>> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("failed to re-read {} for verification", path.display()))?;
-        let (salt, nonce, ciphertext) = parse_armored(&text, &path.display().to_string())?;
+        let (version, salt, nonce, ciphertext) = parse_armored(&text, &path.display().to_string())?;
+        if version != self.version {
+            bail!(
+                "verification: the file just written has version v{version}, expected v{}",
+                self.version
+            );
+        }
         if salt != self.salt {
             bail!("verification: the file just written has an unexpected salt");
         }
@@ -116,31 +181,68 @@ impl Session {
     }
 }
 
-/// Open an existing vault: parse the file, derive the key from `password`,
-/// decrypt, and return the session (for later re-saving) plus the plaintext.
+/// Open an existing vault: parse the file, derive the key from `password`
+/// using the parameters indicated by the on-disk version, decrypt, and return
+/// the session (for later re-saving) plus the plaintext.
+///
+/// The returned session preserves the file's original version, so a plain
+/// `save()` re-encrypts with the *same* parameters. Re-keying to the current
+/// (v2) parameters happens via `upgrade` or `passwd`, both of which call
+/// [`Session::create`] to mint a fresh v2 session.
 pub fn open(path: &Path, password: &[u8]) -> Result<(Session, Zeroizing<Vec<u8>>)> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read vault at {}", path.display()))?;
-    let (salt, nonce, ciphertext) = parse_armored(&text, &path.display().to_string())?;
+    let (version, salt, nonce, ciphertext) = parse_armored(&text, &path.display().to_string())?;
 
-    let key = derive_key(password, &salt)?;
+    let argon = argon2_for_version(version)?;
+    let key = derive_key(password, &salt, &argon)?;
     let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref())
         .map_err(|e| anyhow!("invalid key length: {e}"))?;
     let plaintext = cipher
         .decrypt(Nonce::from_slice(&nonce), ciphertext.as_ref())
         .map_err(|_| anyhow!("decryption failed — wrong password or corrupted file"))?;
 
-    Ok((Session { salt, key }, Zeroizing::new(plaintext)))
+    Ok((
+        Session {
+            salt,
+            key,
+            version,
+        },
+        Zeroizing::new(plaintext),
+    ))
 }
 
-/// Parse an armored vault body into its `(salt, nonce, ciphertext)` parts.
-/// `src` names the source (a path) for error messages.
-fn parse_armored(text: &str, src: &str) -> Result<([u8; SALT_LEN], [u8; NONCE_LEN], Vec<u8>)> {
+/// Read a vault file's on-disk format version (1 = legacy, 2 = current) from
+/// its header alone — no password and no body decode needed. Used to show the
+/// KDF tier in `list` / `dir list` without unlocking the vault.
+pub fn detect_version(path: &Path) -> Result<u8> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read vault at {}", path.display()))?;
+    let header = text.lines().next().unwrap_or("").trim();
+    if header == MAGIC_V1 {
+        Ok(1)
+    } else if header == MAGIC_V2 {
+        Ok(2)
+    } else {
+        bail!("{} is not an envvault file (bad header)", path.display());
+    }
+}
+
+/// Parsed pieces of an armored vault: `(version, salt, nonce, ciphertext)`.
+type ParsedVault = (u8, [u8; SALT_LEN], [u8; NONCE_LEN], Vec<u8>);
+
+/// Parse an armored vault body into its `(version, salt, nonce, ciphertext)`
+/// parts. `src` names the source (a path) for error messages.
+fn parse_armored(text: &str, src: &str) -> Result<ParsedVault> {
     let mut lines = text.lines();
     let header = lines.next().unwrap_or("").trim();
-    if header != MAGIC {
+    let version = if header == MAGIC_V1 {
+        1
+    } else if header == MAGIC_V2 {
+        2
+    } else {
         bail!("{src} is not an envvault file (bad header)");
-    }
+    };
     let b64: String = lines.collect::<Vec<_>>().join("");
     let blob = B64
         .decode(b64.trim())
@@ -152,7 +254,7 @@ fn parse_armored(text: &str, src: &str) -> Result<([u8; SALT_LEN], [u8; NONCE_LE
     let salt: [u8; SALT_LEN] = blob[..SALT_LEN].try_into().unwrap();
     let nonce: [u8; NONCE_LEN] = blob[SALT_LEN..SALT_LEN + NONCE_LEN].try_into().unwrap();
     let ciphertext = blob[SALT_LEN + NONCE_LEN..].to_vec();
-    Ok((salt, nonce, ciphertext))
+    Ok((version, salt, nonce, ciphertext))
 }
 
 #[cfg(test)]
@@ -275,6 +377,90 @@ mod tests {
         std::fs::write(&path, tampered).unwrap();
         assert!(open(&path, b"pw").is_err());
         std::fs::remove_file(&path).ok();
+    }
+
+    /// A session constructed with legacy v1 parameters (the crate defaults)
+    /// reads and writes v1 files. This models a vault created before the
+    /// stronger parameters shipped.
+    fn legacy_session(password: &[u8]) -> Session {
+        let salt = random_array::<SALT_LEN>().unwrap();
+        let key = derive_key(password, &salt, &Argon2::default()).unwrap();
+        Session {
+            salt,
+            key,
+            version: 1,
+        }
+    }
+
+    #[test]
+    fn new_vaults_use_v2_params() {
+        let session = Session::create(b"pw").unwrap();
+        assert!(session.is_current(), "freshly created session should be v2");
+        let armored = session.armor(b"K=v\n").unwrap();
+        assert!(
+            armored.starts_with("ENVVAULT v2\n"),
+            "new vaults must serialize as v2"
+        );
+    }
+
+    #[test]
+    fn v1_vault_round_trips_and_is_upgradeable() {
+        let dir = std::env::temp_dir().join("envvault-test-v1");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("v1.vault");
+
+        // A legacy v1 vault (written with the old crate defaults).
+        let legacy = legacy_session(b"pw");
+        assert!(!legacy.is_current());
+        legacy.save(&path, b"SECRET=v\n").unwrap();
+
+        // Open recognizes the v1 header and decrypts with the legacy params.
+        let (session, pt) = open(&path, b"pw").unwrap();
+        assert_eq!(&pt[..], b"SECRET=v\n");
+        assert!(!session.is_current(), "an opened v1 vault stays v1");
+
+        // Upgrade: re-encrypt the same plaintext under a fresh v2 session
+        // (this is exactly what `cmd_upgrade` does).
+        let upgraded = Session::create(b"pw").unwrap();
+        upgraded.save(&path, &pt).unwrap();
+
+        // The upgraded file is v2 and decrypts to the same contents.
+        let (s2, pt2) = open(&path, b"pw").unwrap();
+        assert!(s2.is_current(), "upgraded vault should be v2");
+        assert_eq!(&pt2[..], b"SECRET=v\n");
+
+        // The wrong password still fails on the upgraded vault.
+        assert!(open(&path, b"wrong").is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v1_and_v2_share_no_header() {
+        // A v1 session must not verify a v2 file (and vice versa), guarding
+        // the version check in decrypt_file.
+        let dir = std::env::temp_dir().join("envvault-test-ver");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p1 = dir.join("a.vault");
+        let p2 = dir.join("b.vault");
+
+        let s1 = legacy_session(b"pw");
+        let s2 = Session::create(b"pw").unwrap();
+        s1.save(&p1, b"K=1\n").unwrap();
+        s2.save(&p2, b"K=2\n").unwrap();
+
+        assert!(
+            s1.decrypt_file(&p2).is_err(),
+            "v1 session must not verify v2 file"
+        );
+        assert!(
+            s2.decrypt_file(&p1).is_err(),
+            "v2 session must not verify v1 file"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
