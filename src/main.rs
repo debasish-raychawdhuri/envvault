@@ -101,11 +101,12 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum DirCmd {
-    /// Encrypt a directory's contents into a vault, then empty the directory.
+    /// Encrypt a directory — or a single file — into a vault, then empty it.
     Init {
-        /// Name for the new directory vault.
+        /// Name for the new vault.
         name: String,
-        /// The directory whose contents to encrypt (e.g. ~/.claude).
+        /// Directory or file to encrypt (e.g. ~/.claude, or one file like
+        /// ~/.local/share/opencode/auth.json that sits in a large directory).
         #[arg(long)]
         path: String,
         /// Skip the confirmation prompt before emptying the directory.
@@ -348,17 +349,25 @@ fn empty_dir(dir: &Path) -> Result<()> {
 fn cmd_dir_init(name: &str, path: &str, yes: bool, password_stdin: bool) -> Result<()> {
     let vault_path = store::dirvault_path(name)?;
     if vault_path.exists() {
-        bail!("a directory vault named '{name}' already exists — refusing to overwrite");
+        bail!("a vault named '{name}' already exists — refusing to overwrite");
     }
     let target = Path::new(path);
-    if !target.is_dir() {
-        bail!("{} is not an existing directory", target.display());
+    if !target.exists() {
+        bail!("{} does not exist", target.display());
     }
     let canonical = target
         .canonicalize()
         .with_context(|| format!("could not resolve {}", target.display()))?;
+    let meta = std::fs::symlink_metadata(&canonical)?;
+    let is_dir = meta.is_dir();
+    if !is_dir && !meta.is_file() {
+        bail!(
+            "{} is neither a regular file nor a directory",
+            canonical.display()
+        );
+    }
 
-    // Emptying the directory is destructive — confirm unless told not to.
+    // Emptying the target is destructive — confirm unless told not to.
     if !yes {
         if password_stdin {
             bail!(
@@ -366,8 +375,13 @@ fn cmd_dir_init(name: &str, path: &str, yes: bool, password_stdin: bool) -> Resu
                 canonical.display()
             );
         }
+        let what = if is_dir {
+            "DELETE its contents"
+        } else {
+            "empty the file"
+        };
         eprint!(
-            "This will encrypt {} into vault '{name}' and then DELETE its contents. Continue? [y/N] ",
+            "This will encrypt {} into vault '{name}' and then {what}. Continue? [y/N] ",
             canonical.display()
         );
         use std::io::Write;
@@ -385,9 +399,16 @@ fn cmd_dir_init(name: &str, path: &str, yes: bool, password_stdin: bool) -> Resu
         password::prompt_new()?
     };
     dirvault::create(&vault_path, pw.as_bytes(), &canonical)?;
-    empty_dir(&canonical)?;
+    if is_dir {
+        empty_dir(&canonical)?;
+    } else {
+        // Leave a 0-byte placeholder so the path stays a valid bind target.
+        std::fs::write(&canonical, b"")
+            .with_context(|| format!("failed to empty {}", canonical.display()))?;
+    }
+    let kind = if is_dir { "directory" } else { "file" };
     println!(
-        "Created directory vault '{name}' from {} and emptied it.\n\
+        "Created {kind} vault '{name}' from {} and emptied it.\n\
          Use it with: envvault dir run {name} -- <command>",
         canonical.display()
     );

@@ -313,26 +313,32 @@ read. See the caveat about clipboard managers under *Security notes* below.
 
 ---
 
-## Directory vaults: keep a tool's config dir encrypted
+## Directory & file vaults: keep a tool's secrets encrypted at rest
 
-Some tools insist on writing secrets to a file rather than reading them from the
-environment — Claude Code's `~/.claude/.credentials.json`, the AWS CLI's
-`~/.aws/credentials`, and so on. A **directory vault** keeps such a directory
-encrypted at rest and exposes its plaintext **only in RAM**, at the original
-path, only while a program you launch is running — then re-encrypts it on exit.
+Some tools insist on writing secrets to disk rather than reading them from the
+environment — Claude Code's `~/.claude/`, the AWS CLI's `~/.aws/credentials`,
+opencode's `~/.local/share/opencode/auth.json`, and so on. A **directory vault**
+— or a **single-file vault**, when the secret is one file marooned in a big
+directory — keeps such a path encrypted at rest and exposes its plaintext **only
+in RAM**, at the original location, only while a program you launch is running —
+then re-encrypts it on exit. `dir init` auto-detects whether `--path` is a
+directory or a file.
 
 ```sh
-# Encrypt ~/.claude into a vault, then empty the real directory
+# A whole config directory:
 envvault dir init claude --path ~/.claude
+envvault dir run  claude -- claude
 
-# Run a tool with the directory transparently decrypted in RAM at ~/.claude
-envvault dir run claude -- claude
+# Or a single file that lives in a large directory (opencode keeps its keys next
+# to a multi-hundred-MB database — vault only the file, leave the rest on disk):
+envvault dir init opencode --path ~/.local/share/opencode/auth.json
+envvault dir run  opencode -- opencode
 
-# Manage directory vaults
+# Manage vaults
 envvault dir list
-envvault dir status claude               # show the stored target path
-envvault dir export claude --to ./backup # decrypt to a directory (writes plaintext!)
-envvault dir rm claude
+envvault dir status opencode             # show the stored target path
+envvault dir export opencode --to ./bak  # decrypt to a directory (writes plaintext!)
+envvault dir rm opencode
 ```
 
 **How it works (Linux).** `dir run` creates a private **user + mount namespace**,
@@ -341,14 +347,17 @@ runs your program (which sees a normal, populated `~/.claude`), and re-encrypts
 from the tmpfs when the program exits. The tmpfs is **visible only to that
 program and its children** — it never appears in the host mount namespace, so
 every other process (even same-uid ones) sees only the empty real directory, and
-it vanishes when the program exits. No root is needed, as long as unprivileged
-user namespaces are enabled (the default on most desktop distros). If they're
-disabled, `dir run` fails with a clear message rather than writing plaintext to
-real disk.
+it vanishes when the program exits. For a **single-file vault** it instead
+decrypts the file onto a private tmpfs and **bind-mounts that one file** over its
+real path, leaving the rest of the directory real and on disk — so a live
+database sitting next to the secret keeps working normally. No root is needed, as
+long as unprivileged user namespaces are enabled (the default on most desktop
+distros). If they're disabled, `dir run` fails with a clear message rather than
+writing plaintext to real disk.
 
 | Command | What it does |
 |---------|--------------|
-| `dir init <name> --path <dir>` | Encrypt `<dir>`'s contents into a vault, then empty the directory. |
+| `dir init <name> --path <path>` | Encrypt a directory **or a single file** into a vault, then empty it. |
 | `dir run <name> -- <cmd>…`     | Decrypt into RAM at the original path, run `<cmd>`, re-encrypt on changes and on exit. |
 | `dir list`                     | List all directory vaults. |
 | `dir status <name>`            | Print the vault's stored target path. |
@@ -383,6 +392,12 @@ real disk.
   scrubbed at every instant."
 - **Directory vaults** (`dir run`) are Linux-only — they rely on unprivileged
   user + mount namespaces. `dir init`/`dir export`/`dir list` work everywhere.
+- A **single-file vault** virtualizes only that one file (bind-mounted from RAM);
+  everything else in its directory stays real on disk. This is clean for files
+  read at startup or written *in place* (the common case, including static API
+  keys). A file rewritten via atomic-rename *during* a session (e.g. some OAuth
+  token-refresh flows) isn't captured by the bind — a flagged limitation, not a
+  silent one.
 - `dir init` **deletes** the original files but does not *securely shred* them:
   the plaintext that was already on disk before you vaulted it may remain
   recoverable from free space until overwritten (especially on SSDs/CoW

@@ -65,6 +65,7 @@ where
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
+    use crate::dirvault::Kind;
     use anyhow::Context;
     use std::collections::hash_map::DefaultHasher;
     use std::ffi::CString;
@@ -127,13 +128,39 @@ mod linux {
         let dirvault = Arc::new(open()?);
         let target = dirvault.target().to_path_buf();
 
-        // 4. Mount a fresh tmpfs over the target and extract into it (RAM only).
-        std::fs::create_dir_all(&target)
-            .with_context(|| format!("failed to create mountpoint {}", target.display()))?;
-        mount_tmpfs(&target)?;
-        dirvault
-            .extract_into(&target)
-            .context("failed to populate the in-memory directory")?;
+        // 4. Expose the decrypted contents at `target`, in RAM only.
+        match dirvault.kind() {
+            Kind::Dir => {
+                // tmpfs over the directory, then extract the tree into it.
+                std::fs::create_dir_all(&target)
+                    .with_context(|| format!("failed to create mountpoint {}", target.display()))?;
+                mount_tmpfs(&target)?;
+                dirvault
+                    .extract_into(&target)
+                    .context("failed to populate the in-memory directory")?;
+            }
+            Kind::File => {
+                // Keep the rest of the directory real on disk; only the single
+                // file is virtualized. Decrypt it onto a private tmpfs and
+                // bind-mount that RAM file over the real (placeholder) path.
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| format!("failed to create {}", parent.display()))?;
+                }
+                if !target.exists() {
+                    std::fs::write(&target, b"").with_context(|| {
+                        format!("failed to create placeholder {}", target.display())
+                    })?;
+                }
+                let scratch = scratch_mount_dir()?;
+                mount_tmpfs(&scratch)?;
+                dirvault
+                    .extract_into(&scratch)
+                    .context("failed to populate the in-memory file")?;
+                let basename = target.file_name().context("vaulted file has no file name")?;
+                bind_file(&scratch.join(basename), &target)?;
+            }
+        }
 
         // 5. Optionally start the debounced autosaver (spawned after unshare, so
         //    the single-thread requirement for CLONE_NEWUSER was already met).
@@ -207,12 +234,12 @@ mod linux {
     ) -> thread::JoinHandle<()> {
         thread::spawn(move || {
             let poll = Duration::from_millis(500);
-            let mut last_seen = dir_fingerprint(&target);
+            let mut last_seen = path_fingerprint(&target);
             let mut last_saved = last_seen; // the just-extracted state is on disk
             let mut last_change = Instant::now();
             while !stop.load(Ordering::Relaxed) {
                 thread::sleep(poll);
-                let fp = dir_fingerprint(&target);
+                let fp = path_fingerprint(&target);
                 if fp != last_seen {
                     last_seen = fp;
                     last_change = Instant::now();
@@ -228,12 +255,20 @@ mod linux {
         })
     }
 
-    /// A cheap fingerprint of a directory tree: every entry's path, size, and
-    /// mtime folded into one number. Changes when files are added, removed,
-    /// resized, or rewritten (which bumps mtime).
-    fn dir_fingerprint(dir: &Path) -> u64 {
+    /// A cheap fingerprint of a path: for a directory, every entry's path/size/
+    /// mtime folded together; for a single file, its size + mtime. Changes when
+    /// content is added, removed, resized, or rewritten (which bumps mtime).
+    fn path_fingerprint(path: &Path) -> u64 {
         let mut hasher = DefaultHasher::new();
-        fingerprint_into(dir, &mut hasher);
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.is_dir() => fingerprint_into(path, &mut hasher),
+            Ok(meta) => {
+                hasher.write_u64(meta.len());
+                hasher.write_i64(meta.mtime());
+                hasher.write_i64(meta.mtime_nsec());
+            }
+            Err(_) => {}
+        }
         hasher.finish()
     }
 
@@ -255,6 +290,33 @@ mod linux {
                 }
             }
         }
+    }
+
+    /// A fresh private mountpoint for a file-vault tmpfs. Lives under
+    /// `$XDG_RUNTIME_DIR` (already tmpfs, cleaned at logout) or the temp dir.
+    fn scratch_mount_dir() -> Result<PathBuf> {
+        let base = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let dir = base.join(format!(".envvault-mnt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("failed to create scratch mountpoint {}", dir.display()))?;
+        Ok(dir)
+    }
+
+    /// `mount(src, target, NULL, MS_BIND, NULL)` — splice the file at `src` in
+    /// at `target` (both must already exist).
+    fn bind_file(src: &Path, target: &Path) -> Result<()> {
+        let s = CString::new(src.as_os_str().as_bytes()).context("source path has a NUL byte")?;
+        let t = CString::new(target.as_os_str().as_bytes()).context("target path has a NUL byte")?;
+        let rc = unsafe {
+            libc::mount(s.as_ptr(), t.as_ptr(), ptr::null(), libc::MS_BIND, ptr::null())
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("failed to bind-mount onto {}", target.display()));
+        }
+        Ok(())
     }
 
     /// Toggle this process's dumpable attribute via `prctl(PR_SET_DUMPABLE)`.
