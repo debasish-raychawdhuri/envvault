@@ -51,6 +51,10 @@ enum Cmd {
         #[arg(long)]
         password_stdin: bool,
     },
+    /// Change a vault's password, re-encrypting its contents under the new one.
+    Passwd {
+        name: String,
+    },
     /// Decrypt in memory and run a program with the vault's secrets in its env.
     Run {
         name: String,
@@ -108,6 +112,7 @@ fn run_cli() -> Result<()> {
             name,
             password_stdin,
         } => cmd_edit(&name, password_stdin),
+        Cmd::Passwd { name } => cmd_passwd(&name),
         Cmd::Run {
             name,
             password_stdin,
@@ -187,6 +192,20 @@ fn cmd_edit(name: &str, password_stdin: bool) -> Result<()> {
     let path = resolve_existing(name)?;
     let (session, vault) = open_vault(&path, password_stdin)?;
     tui::run(&session, &path, vault)
+}
+
+fn cmd_passwd(name: &str) -> Result<()> {
+    let path = resolve_existing(name)?;
+    // Verify the current password by actually decrypting with it.
+    let old_pw = password::prompt("Current vault password: ")?;
+    let (_old_session, plaintext) = crypto::open(&path, old_pw.as_bytes())?;
+    // Acquire and confirm the new password, then re-encrypt the same contents
+    // under a fresh salt + key (Session::create generates a new salt).
+    let new_pw = password::prompt_new()?;
+    let new_session = Session::create(new_pw.as_bytes())?;
+    new_session.save(&path, &plaintext)?;
+    println!("Password changed for vault '{name}'");
+    Ok(())
 }
 
 fn cmd_run(name: &str, password_stdin: bool, command: &[String]) -> Result<()> {

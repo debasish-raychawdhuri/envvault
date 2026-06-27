@@ -236,6 +236,9 @@ envvault list
 # Edit a vault's secrets interactively (view / add / modify / delete)
 envvault edit work
 
+# Change a vault's password (asks for the current one, then the new one twice)
+envvault passwd work
+
 # Run a program with the vault's variables in its environment
 envvault run work -- python train.py
 envvault run work -- bash -lc 'echo $OPENAI_API_KEY'
@@ -258,6 +261,7 @@ envvault show work
 | `init <name>`            | Create a new vault (then open the editor). |
 | `list`                   | List all vaults in the vault directory. |
 | `edit <name>`            | Open the interactive TUI to manage secrets. |
+| `passwd <name>`          | Change the vault's password (verifies the old one, re-encrypts under the new). |
 | `run <name> -- <cmd>…`   | Decrypt in memory and run `<cmd>` with the secrets in its environment. |
 | `set <name> KEY …`       | Add/update keys; the value for each is entered at a no-echo prompt. |
 | `rm <name> KEY …`        | Remove one or more keys. |
@@ -266,9 +270,9 @@ envvault show work
 By default you are prompted for the vault password with no echo. Add
 `--password-stdin` to any command to read the password from stdin instead — for
 automation, e.g. `echo "$PW" | envvault run work --password-stdin -- ./deploy`.
-(`--password-stdin` isn't available on the interactive `edit` and `set`
-commands, which need the terminal to prompt you — `edit` for the UI and `set`
-for each value.)
+(`--password-stdin` isn't available on the interactive `edit`, `set`, and
+`passwd` commands, which need the terminal to prompt you — `edit` for the UI,
+`set` for each value, and `passwd` for the old and new passwords.)
 
 ### The interactive editor
 

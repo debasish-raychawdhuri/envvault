@@ -131,6 +131,28 @@ mod tests {
     }
 
     #[test]
+    fn change_password_reencrypts() {
+        let dir = std::env::temp_dir().join("envvault-test-cp");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cp.vault");
+
+        let session = Session::create(b"oldpw").unwrap();
+        session.save(&path, b"SECRET=v\n").unwrap();
+
+        // Re-key: open with the old password, re-encrypt under a new one
+        // (this is exactly what `cmd_passwd` does).
+        let (_old, plaintext) = open(&path, b"oldpw").unwrap();
+        let new_session = Session::create(b"newpw").unwrap();
+        new_session.save(&path, &plaintext).unwrap();
+
+        // The new password decrypts the same contents; the old one no longer does.
+        let (_s, pt) = open(&path, b"newpw").unwrap();
+        assert_eq!(&pt[..], b"SECRET=v\n");
+        assert!(open(&path, b"oldpw").is_err());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn wrong_password_fails() {
         let dir = std::env::temp_dir().join("envvault-test-wp");
         std::fs::create_dir_all(&dir).unwrap();
