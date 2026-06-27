@@ -19,9 +19,19 @@ fn main() {
 
     let compiler = cc::Build::new().get_compiler();
     let mut cmd = compiler.to_command();
-    cmd.args(["-shared", "-fPIC", "-O2", "-o"])
-        .arg(&so_path)
-        .arg("shim/harden.c");
+    // Hardening flags for this small but security-critical C component.
+    // _FORTIFY_SOURCE needs optimization (-O2) to take effect.
+    cmd.args([
+        "-shared",
+        "-fPIC",
+        "-O2",
+        "-fstack-protector-strong",
+        "-fno-strict-aliasing",
+        "-D_FORTIFY_SOURCE=2",
+        "-o",
+    ])
+    .arg(&so_path)
+    .arg("shim/harden.c");
 
     let status = cmd
         .status()

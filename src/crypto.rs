@@ -35,6 +35,12 @@ const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
 const KEY_LEN: usize = 32;
 
+/// Refuse to load a vault file larger than this before decoding it, so a crafted
+/// oversized file can't OOM the process before the AEAD check runs. A directory
+/// vault's plaintext is capped at 256 MiB (see `dirvault::MAX_ARCHIVE`); base64
+/// inflates that ~4/3, so 512 MiB comfortably covers any legitimate vault.
+const MAX_VAULT_FILE: u64 = 512 * 1024 * 1024;
+
 /// Argon2id parameters for the current (v2) format. m=65536 KiB (64 MiB) makes
 /// brute-forcing a stolen vault file substantially more expensive than the
 /// legacy defaults, at the cost of ~60–100 ms per open (acceptable for a
@@ -190,8 +196,7 @@ impl Session {
 /// (v2) parameters happens via `upgrade` or `passwd`, both of which call
 /// [`Session::create`] to mint a fresh v2 session.
 pub fn open(path: &Path, password: &[u8]) -> Result<(Session, Zeroizing<Vec<u8>>)> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read vault at {}", path.display()))?;
+    let text = read_capped(path)?;
     let (version, salt, nonce, ciphertext) = parse_armored(&text, &path.display().to_string())?;
 
     let argon = argon2_for_version(version)?;
@@ -216,9 +221,18 @@ pub fn open(path: &Path, password: &[u8]) -> Result<(Session, Zeroizing<Vec<u8>>
 /// its header alone — no password and no body decode needed. Used to show the
 /// KDF tier in `list` / `dir list` without unlocking the vault.
 pub fn detect_version(path: &Path) -> Result<u8> {
-    let text = std::fs::read_to_string(path)
+    use std::io::Read;
+    // Read only enough for the one-line header — never load the whole file (a
+    // multi-GB file would otherwise be slurped just to print its version).
+    let mut f = std::fs::File::open(path)
         .with_context(|| format!("failed to read vault at {}", path.display()))?;
-    let header = text.lines().next().unwrap_or("").trim();
+    let mut buf = [0u8; 64];
+    let n = f
+        .read(&mut buf)
+        .with_context(|| format!("failed to read vault at {}", path.display()))?;
+    let head = &buf[..n];
+    let line = head.split(|&b| b == b'\n').next().unwrap_or(head);
+    let header = std::str::from_utf8(line).unwrap_or("").trim();
     if header == MAGIC_V1 {
         Ok(1)
     } else if header == MAGIC_V2 {
@@ -226,6 +240,24 @@ pub fn detect_version(path: &Path) -> Result<u8> {
     } else {
         bail!("{} is not an envvault file (bad header)", path.display());
     }
+}
+
+/// Read a vault file to a string, refusing one larger than [`MAX_VAULT_FILE`]
+/// (checked via the file's length before allocating), so a crafted oversized
+/// file can't exhaust memory before the AEAD authentication runs.
+fn read_capped(path: &Path) -> Result<String> {
+    let meta = std::fs::metadata(path)
+        .with_context(|| format!("failed to stat vault at {}", path.display()))?;
+    if meta.len() > MAX_VAULT_FILE {
+        bail!(
+            "{} is too large to be a vault ({} bytes > {} MiB cap)",
+            path.display(),
+            meta.len(),
+            MAX_VAULT_FILE / (1024 * 1024)
+        );
+    }
+    std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read vault at {}", path.display()))
 }
 
 /// Parsed pieces of an armored vault: `(version, salt, nonce, ciphertext)`.

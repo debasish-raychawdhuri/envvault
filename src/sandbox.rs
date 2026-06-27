@@ -257,7 +257,12 @@ mod linux {
             .wait()
             .context("failed waiting for child process")?;
 
-        // 8. Stop the autosaver and flush a final, authoritative snapshot.
+        // 8. The child is gone; restore default signal handling so the final
+        //    re-encrypt below is interruptible with Ctrl-C if it ever hangs
+        //    (e.g. a full or stuck disk) rather than requiring `kill -9`.
+        restore_default_signals();
+
+        // Stop the autosaver and flush a final, authoritative snapshot.
         stop.store(true, Ordering::Relaxed);
         if let Some(handle) = autosaver {
             let _ = handle.join();
@@ -610,6 +615,16 @@ mod linux {
         for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
             unsafe {
                 libc::signal(sig, libc::SIG_IGN);
+            }
+        }
+    }
+
+    /// Restore default handling for the signals `ignore_signals` muted, so the
+    /// supervisor is interruptible again once the child has exited.
+    fn restore_default_signals() {
+        for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
+            unsafe {
+                libc::signal(sig, libc::SIG_DFL);
             }
         }
     }

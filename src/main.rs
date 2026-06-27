@@ -368,7 +368,11 @@ fn cmd_init(name: &str, password_stdin: bool, no_edit: bool) -> Result<()> {
         bail!("a vault named '{name}' already exists — refusing to overwrite");
     }
     let pw = if password_stdin {
-        password::read_stdin()?
+        let pw = password::read_stdin()?;
+        if pw.is_empty() {
+            bail!("refusing to create a vault with an empty password");
+        }
+        pw
     } else {
         password::prompt_new()?
     };
@@ -606,6 +610,40 @@ fn empty_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Return the first path under `root` that lives on a different filesystem than
+/// `root` itself (i.e. a mount point). `dir init` archives a directory with
+/// `append_dir_all`, which crosses mount boundaries, and then deletes what it
+/// packed — so we use this to refuse before vaulting an unintended mount.
+#[cfg(unix)]
+fn find_submount(root: &Path) -> Result<Option<std::path::PathBuf>> {
+    use std::os::unix::fs::MetadataExt;
+    let root_dev = std::fs::symlink_metadata(root)?.dev();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let m = match std::fs::symlink_metadata(&p) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if m.file_type().is_symlink() {
+                continue; // don't follow symlinks out of the tree
+            }
+            if m.dev() != root_dev {
+                return Ok(Some(p));
+            }
+            if m.is_dir() {
+                stack.push(p);
+            }
+        }
+    }
+    Ok(None)
+}
+
 fn cmd_dir_init(name: &str, path: &str, yes: bool, password_stdin: bool) -> Result<()> {
     let vault_path = store::dirvault_path(name)?;
     if vault_path.exists() {
@@ -624,6 +662,21 @@ fn cmd_dir_init(name: &str, path: &str, yes: bool, password_stdin: bool) -> Resu
         bail!(
             "{} is neither a regular file nor a directory",
             canonical.display()
+        );
+    }
+
+    // A mount point inside the directory would be archived by `append_dir_all`
+    // and then DELETED by `empty_dir` — refuse rather than vault+destroy an
+    // unintended filesystem's contents.
+    #[cfg(unix)]
+    if is_dir
+        && let Some(mp) = find_submount(&canonical)?
+    {
+        bail!(
+            "{} contains a mount point ({}); refusing — `dir init` would archive and \
+             then delete its contents. Unmount it first, or vault a different path.",
+            canonical.display(),
+            mp.display()
         );
     }
 

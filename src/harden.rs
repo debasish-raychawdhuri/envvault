@@ -26,8 +26,10 @@
 
 /// Linux/Android: mark the process non-dumpable.
 ///
-/// Best-effort: a failure is reported on stderr but is not fatal (the only
-/// documented failure is invalid arguments, which cannot happen here).
+/// **Fatal on failure.** The only way `prctl(PR_SET_DUMPABLE, 0)` fails here is a
+/// kernel that refuses it (e.g. a seccomp filter). On Linux this is the *whole*
+/// protection — proceeding would leave secrets readable in memory by any same-uid
+/// process — so we refuse to run rather than silently degrade.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn protect_process() {
     // SAFETY: `prctl(PR_SET_DUMPABLE, 0)` only toggles this process's dumpable
@@ -35,7 +37,13 @@ pub fn protect_process() {
     let rc = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0 as libc::c_ulong) };
     if rc != 0 {
         let err = std::io::Error::last_os_error();
-        eprintln!("warning: could not mark process non-dumpable (core dumps may expose secrets): {err}");
+        eprintln!(
+            "error: could not mark this process non-dumpable ({err}).\n\
+             On Linux this is the core protection against a same-uid process \
+             reading secrets from memory; refusing to run rather than expose them. \
+             (Is prctl(PR_SET_DUMPABLE) blocked by a seccomp filter?)"
+        );
+        std::process::exit(1);
     }
 }
 

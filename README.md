@@ -584,6 +584,13 @@ with, it can only affect the *already-visible* allowed paths — never the
 structurally-removed ones. `--harden` and `--sandbox` compose (hardened secret
 delivery + masked session).
 
+**`--allow` is path-granular, not file-granular.** Allowing a directory exposes
+*everything* inside it, including things you might not be thinking about —
+`--allow ~/.aws` reveals not just `~/.aws/credentials` but also `~/.aws/sso/cache`
+and any other tokens there. Allow the narrowest path that works (a single file if
+the tool reads only one), and remember that whatever you allow is visible to the
+program *and* to any code it runs.
+
 ## Security notes & limitations
 
 - **Your password is the whole game.** Argon2id makes brute force costly, but a
