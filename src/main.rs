@@ -240,6 +240,19 @@ enum DirCmd {
         /// its memory. Best-effort (warns if the shim can't load); Linux only.
         #[arg(long)]
         harden: bool,
+        /// Hide your credential files (~/.ssh, ~/.aws, …) from the program and
+        /// everything it spawns, for the whole session (same as `run --sandbox`).
+        #[arg(long)]
+        sandbox: bool,
+        /// A credential path to leave visible under the sandbox (repeatable);
+        /// implies --sandbox.
+        #[arg(long)]
+        allow: Vec<String>,
+        /// Verify your config/trust files against the root-owned baseline and
+        /// freeze the verified copy into the session; fails closed on any
+        /// mismatch (same as `run --verify`; needs `sudo envvault baseline set`).
+        #[arg(long)]
+        verify: bool,
         /// The program to run, followed by its arguments (use `--` first).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true, num_args = 1..)]
         command: Vec<String>,
@@ -366,6 +379,9 @@ fn run_dir(command: DirCmd) -> Result<()> {
             no_autosave,
             autosave_debounce,
             harden,
+            sandbox,
+            allow,
+            verify,
             command,
         } => cmd_dir_run(
             &name,
@@ -373,6 +389,9 @@ fn run_dir(command: DirCmd) -> Result<()> {
             no_autosave,
             autosave_debounce,
             harden,
+            sandbox,
+            &allow,
+            verify,
             &command,
         ),
         DirCmd::List => cmd_dir_list(),
@@ -850,6 +869,45 @@ fn cmd_unrun(extra_hide: &[String], command: &[String]) -> Result<()> {
     sandbox::unrun(program, args, &paths)
 }
 
+/// Apply `--verify`/`--sandbox`/`--allow` hardening inside the already-entered
+/// private namespace (non-dumpable), before the child runs. Shared by `run` and
+/// `dir run`:
+/// - `--verify`: check the config/trust files against the root-owned baseline
+///   and freeze the verified copy in. **Fails closed** on any mismatch.
+/// - `--sandbox`/`--allow`: structurally mask every default credential path
+///   except the allowed and frozen ones, and export the soft allow-list so a
+///   nested `unrun` knows what to leave visible.
+///
+/// Must be called single-threaded (before any child or autosaver thread), since
+/// it `set_var`s `ENVVAULT_ALLOW`.
+fn harden_session_in_ns(verify: bool, sandbox: bool, allow: &[String]) -> Result<()> {
+    let allow_paths: Vec<std::path::PathBuf> = allow.iter().map(|s| normalize_path(s)).collect();
+    let mut frozen_paths: Vec<std::path::PathBuf> = Vec::new();
+    if verify {
+        let user = current_user()?;
+        let items = integrity::verify_and_collect(&integrity::read(&user)?)?;
+        frozen_paths = items.iter().map(|i| i.path().to_path_buf()).collect();
+        sandbox::freeze_items(&items)?;
+    }
+    if sandbox || !allow.is_empty() {
+        // Frozen paths must not also be masked (freeze wins for shared paths
+        // like ~/.npmrc); allowed paths stay visible.
+        let mask: Vec<std::path::PathBuf> = default_cred_paths()
+            .into_iter()
+            .filter(|p| !allow_paths.contains(p) && !frozen_paths.contains(p))
+            .collect();
+        sandbox::mask_paths(&mask)?;
+        let allow_env = allow_paths
+            .iter()
+            .filter_map(|p| p.to_str())
+            .collect::<Vec<_>>()
+            .join(":");
+        // SAFETY: single-threaded here, before any child is spawned.
+        unsafe { std::env::set_var("ENVVAULT_ALLOW", allow_env) };
+    }
+    Ok(())
+}
+
 fn cmd_run(
     name: &str,
     password_stdin: bool,
@@ -870,44 +928,12 @@ fn cmd_run(
     // private namespace established before any untrusted code runs.
     let need_ns = sandbox || !allow.is_empty() || verify;
     if need_ns {
-        let allow: Vec<std::path::PathBuf> = allow.iter().map(|s| normalize_path(s)).collect();
-        // 1. Enter the namespace BEFORE decrypting, so no secret is in memory
-        //    during the brief dumpable id-map window.
+        // Enter the namespace BEFORE decrypting (no secret in memory during the
+        // brief dumpable id-map window), decrypt, then apply the in-namespace
+        // hardening, then exec/fork the child (which inherits all of it).
         sandbox::enter_user_mount_ns()?;
-        // 2. Decrypt now (still non-dumpable; the vault dir is still visible).
         let (_session, vault) = open_vault(&path, password_stdin)?;
-        // 3. With --verify: check the config/trust files against the root-owned
-        //    baseline (fails closed on any mismatch) and freeze the verified
-        //    copy into the session. Frozen paths are recorded so they aren't
-        //    also masked below (freeze wins for shared paths like ~/.npmrc).
-        let mut frozen: Vec<std::path::PathBuf> = Vec::new();
-        if verify {
-            let user = current_user()?;
-            let baseline = integrity::read(&user)?;
-            let items = integrity::verify_and_collect(&baseline)?;
-            frozen = items.iter().map(|i| i.path().to_path_buf()).collect();
-            sandbox::freeze_items(&items)?;
-        }
-        // 4. With --sandbox/--allow: structurally hide every default credential
-        //    path except the allowed (and frozen) ones — the hard boundary.
-        if sandbox || !allow.is_empty() {
-            let mask: Vec<std::path::PathBuf> = default_cred_paths()
-                .into_iter()
-                .filter(|p| !allow.contains(p) && !frozen.contains(p))
-                .collect();
-            sandbox::mask_paths(&mask)?;
-            // Export the (soft) allow-list so a nested `unrun` won't re-hide the
-            // paths the human chose to leave visible.
-            let allow_env = allow
-                .iter()
-                .filter_map(|p| p.to_str())
-                .collect::<Vec<_>>()
-                .join(":");
-            // SAFETY: single-threaded here, before any child is spawned.
-            unsafe { std::env::set_var("ENVVAULT_ALLOW", allow_env) };
-        }
-        // 5. Run inside the namespace (exec, or fork under --harden); the child
-        //    inherits the namespace, every mask, and every frozen file.
+        harden_session_in_ns(verify, sandbox, allow)?;
         return run::run(&vault, program, args, quiet, harden);
     }
 
@@ -1076,6 +1102,9 @@ fn cmd_dir_run(
     no_autosave: bool,
     autosave_debounce: u64,
     harden: bool,
+    sandbox: bool,
+    allow: &[String],
+    verify: bool,
     command: &[String],
 ) -> Result<()> {
     let vault_path = resolve_existing_dirvault(name)?;
@@ -1087,13 +1116,26 @@ fn cmd_dir_run(
     } else {
         Some(std::time::Duration::from_secs(autosave_debounce))
     };
-    // The vault is opened (password prompt + decrypt) by this closure, which
+    // Owned copy of the allow-list for the prepare closure (it outlives `allow`).
+    let allow: Vec<String> = allow.to_vec();
+    // The vault is opened (password prompt + decrypt) by the first closure, which
     // `sandbox::run` calls only after setting up the namespace and re-hardening
-    // the process — so no secret exists during the brief dumpable window.
-    sandbox::run(&vault_path, program, args, autosave, harden, || {
-        let pw = get_password(password_stdin)?;
-        dirvault::open(&vault_path, pw.as_bytes())
-    })
+    // the process — so no secret exists during the brief dumpable window. The
+    // second closure runs inside that namespace, after the contents are exposed
+    // and before the child starts, applying --verify/--sandbox/--allow (and
+    // failing closed there if --verify detects tampering).
+    sandbox::run(
+        &vault_path,
+        program,
+        args,
+        autosave,
+        harden,
+        || {
+            let pw = get_password(password_stdin)?;
+            dirvault::open(&vault_path, pw.as_bytes())
+        },
+        move || harden_session_in_ns(verify, sandbox, &allow),
+    )
 }
 
 fn cmd_dir_list() -> Result<()> {

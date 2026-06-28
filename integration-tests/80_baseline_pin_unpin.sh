@@ -59,4 +59,21 @@ assert_contains "child under tracked dir is skipped" "$out" "already covered by 
 as_root "$BIN" baseline unpin --user "$U" "$DIR" >/dev/null
 shows "$CHILD" && fail "unpin dir drops child" "child still tracked" || pass "unpin dir drops child"
 
+# A pin's effect is enforced by BOTH run modes against the shared baseline.
+# (A is currently pinned and clean; C is still tracked too.)
+echo "$PW" | "$BIN" init wv --password-stdin --no-edit >/dev/null
+ddir="$WORK/dv"; mkdir -p "$ddir"; printf 'x\n' > "$ddir/f"
+echo "$PW" | "$BIN" dir init dv --path "$ddir" --yes --password-stdin >/dev/null
+
+e="$(echo "$PW" | "$BIN" run wv --password-stdin --verify -- echo OK 2>&1)"
+d="$(echo "$PW" | "$BIN" dir run dv --password-stdin --verify -- echo OK 2>&1)"
+[[ "$e" == *OK* ]] && pass "env run --verify honors the pinned baseline (clean)" || fail "env run --verify honors the pinned baseline" "${e:0:200}"
+[[ "$d" == *OK* ]] && pass "dir run --verify honors the pinned baseline (clean)" || fail "dir run --verify honors the pinned baseline" "${d:0:200}"
+
+printf 'A-tampered-again\n' > "$A"   # tamper the pinned file
+e="$(echo "$PW" | "$BIN" run wv --password-stdin --verify -- echo RAN 2>&1)"; re=$?
+d="$(echo "$PW" | "$BIN" dir run dv --password-stdin --verify -- echo RAN 2>&1)"; rd=$?
+if [ $re -ne 0 ] && [[ "$e" != *RAN* ]] && [[ "$e" == *"$A"* ]]; then pass "env run --verify aborts on tampered pinned file"; else fail "env run --verify aborts on tampered pinned file" "rc=$re ${e:0:160}"; fi
+if [ $rd -ne 0 ] && [[ "$d" != *RAN* ]] && [[ "$d" == *"$A"* ]]; then pass "dir run --verify aborts on tampered pinned file"; else fail "dir run --verify aborts on tampered pinned file" "rc=$rd ${d:0:160}"; fi
+
 as_root rm -rf /etc/envvault

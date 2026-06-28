@@ -1,18 +1,22 @@
 #!/usr/bin/env bash
-# Config-integrity baseline + `run --verify`. The root-owned write/perms, freeze,
-# TOCTOU, directory-completeness, absent-neutralize and compose checks need sudo
-# and SKIP cleanly without it; the non-root guards (root-required, fail-closed
-# without a baseline) always run.
+# Config-integrity baseline + `--verify` in BOTH run modes (env `run --verify`
+# and `dir run --verify`), sharing one root-owned baseline. The root-owned
+# write/perms, freeze, TOCTOU, dir-completeness, absent-neutralize and compose
+# checks need sudo and SKIP cleanly without it; the non-root guards (root-
+# required, fail-closed without a baseline, in both modes) always run.
 #
 # Tracks only temp paths under $WORK. NOTE: `baseline set` additionally hashes
 # the invoking user's real trust files (read-only) because the default set is
 # resolved from the passwd home; assertions key on the temp paths only.
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
-feature "baseline + run --verify"
+feature "baseline + verify (env + dir)"
 new_work
 
 U="$(id -un)"
 echo "$PW" | "$BIN" init work --password-stdin --no-edit >/dev/null
+# a directory vault, so we can exercise `dir run --verify` against the same baseline
+dsrc="$WORK/dvsrc"; mkdir -p "$dsrc"; printf 'seed\n' > "$dsrc/f"
+echo "$PW" | "$BIN" dir init dv --path "$dsrc" --yes --password-stdin >/dev/null
 trust="$WORK/trust"; mkdir -p "$trust/store"
 tfile="$trust/app.conf"
 tdir="$trust/store"
@@ -34,8 +38,15 @@ if [ ! -e "/etc/envvault/$U.baseline" ]; then
     else
         fail "run --verify fails closed without a baseline" "rc=$rc out=${out:0:200}"
     fi
+    out="$(echo "$PW" | "$BIN" dir run dv --password-stdin --verify -- echo SHOULD_NOT_RUN 2>&1)"; rc=$?
+    if [ $rc -ne 0 ] && [[ "$out" != *SHOULD_NOT_RUN* ]] && [[ "$out" == *"no integrity baseline"* ]]; then
+        pass "dir run --verify fails closed without a baseline"
+    else
+        fail "dir run --verify fails closed without a baseline" "rc=$rc out=${out:0:200}"
+    fi
 else
     skip "run --verify fails closed without a baseline" "a baseline already exists for $U"
+    skip "dir run --verify fails closed without a baseline" "a baseline already exists for $U"
 fi
 
 # --- root-only from here ---
@@ -101,6 +112,25 @@ out="$(echo "$PW" | "$BIN" run work --password-stdin --sandbox --verify --harden
       bash -c "echo cfg=\$(cat '$tfile' | head -1); echo aws=\$(ls -A ~/.aws | wc -l)" 2>/dev/null)"
 assert_contains "compose: frozen config visible" "$out" "cfg=ca = local"
 assert_contains "compose: creds masked under sandbox" "$out" "aws=0"
+
+# ---- dir mode: the SAME baseline is honored by `dir run --verify` ----
+out="$(echo "$PW" | "$BIN" dir run dv --password-stdin --verify -- cat "$tfile" 2>/dev/null)"
+assert_contains "dir run --verify: frozen config visible" "$out" "proxy = none"
+
+printf 'ca = /evil-dir\n' > "$tfile"
+out="$(echo "$PW" | "$BIN" dir run dv --password-stdin --verify -- echo RAN 2>&1)"; rc=$?
+if [ $rc -ne 0 ] && [[ "$out" != *RAN* ]] && [[ "$out" == *"$tfile"* ]]; then
+    pass "dir run --verify: poison aborts, names file"
+else
+    fail "dir run --verify: poison aborts, names file" "rc=$rc ${out:0:200}"
+fi
+printf 'ca = local\nproxy = none\n' > "$tfile"; as_root "$BIN" baseline pin --user "$U" "$tfile" >/dev/null 2>&1
+
+# dir-mode full compose: --sandbox + --verify + --harden together
+out="$(echo "$PW" | "$BIN" dir run dv --password-stdin --sandbox --verify --harden -- \
+      bash -c "echo cfg=\$(cat '$tfile' | head -1); echo aws=\$(ls -A ~/.aws | wc -l)" 2>/dev/null)"
+assert_contains "dir compose: frozen config visible" "$out" "cfg=ca = local"
+assert_contains "dir compose: creds masked under sandbox" "$out" "aws=0"
 
 # cleanup root state
 as_root rm -rf /etc/envvault

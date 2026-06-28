@@ -28,34 +28,41 @@ use std::time::Duration;
 /// during the run once changes have been quiet for `debounce`. `open` decrypts
 /// the vault (prompting for the password) and is invoked only after the process
 /// has been re-hardened, so the secret never exists while the process is briefly
-/// dumpable. On a zero exit this returns `Ok(())`; otherwise it calls
+/// dumpable. `prepare` runs inside the namespace after the decrypted contents
+/// are exposed and *before* the child is spawned — the hook where `dir run`'s
+/// `--verify`/`--sandbox` apply their in-namespace freeze/mask (and may fail
+/// closed). On a zero exit this returns `Ok(())`; otherwise it calls
 /// `std::process::exit` with the child's code.
 #[cfg(target_os = "linux")]
-pub fn run<F>(
+pub fn run<F, G>(
     vault_path: &Path,
     program: &str,
     args: &[String],
     autosave: Option<Duration>,
     harden: bool,
     open: F,
+    prepare: G,
 ) -> Result<()>
 where
     F: FnOnce() -> Result<DirVault>,
+    G: FnOnce() -> Result<()>,
 {
-    linux::run(vault_path, program, args, autosave, harden, open)
+    linux::run(vault_path, program, args, autosave, harden, open, prepare)
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn run<F>(
+pub fn run<F, G>(
     _vault_path: &Path,
     _program: &str,
     _args: &[String],
     _autosave: Option<Duration>,
     _harden: bool,
     _open: F,
+    _prepare: G,
 ) -> Result<()>
 where
     F: FnOnce() -> Result<DirVault>,
+    G: FnOnce() -> Result<()>,
 {
     anyhow::bail!(
         "directory vaults (`dir run`) are only supported on Linux — they rely on \
@@ -149,16 +156,18 @@ mod linux {
     use std::thread;
     use std::time::Instant;
 
-    pub fn run<F>(
+    pub fn run<F, G>(
         vault_path: &Path,
         program: &str,
         args: &[String],
         autosave: Option<Duration>,
         harden: bool,
         open: F,
+        prepare: G,
     ) -> Result<()>
     where
         F: FnOnce() -> Result<DirVault>,
+        G: FnOnce() -> Result<()>,
     {
         // Capture our real ids BEFORE unshare: inside an unmapped user
         // namespace the process appears as the overflow uid (65534/nobody), so
@@ -242,6 +251,13 @@ mod linux {
                     .context("failed to populate the in-memory file")?;
             }
         }
+
+        // 4b. Apply any in-namespace hardening (`dir run --verify`/`--sandbox`):
+        //     verify+freeze config and mask credential paths, before the child
+        //     runs and while still non-dumpable. May fail closed — if it does we
+        //     bail here, before spawning the child and before any re-encrypt, so
+        //     the on-disk vault is left untouched.
+        prepare()?;
 
         // 5. Optionally start the debounced autosaver (spawned after unshare, so
         //    the single-thread requirement for CLONE_NEWUSER was already met).

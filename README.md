@@ -743,8 +743,12 @@ or file, vault the path and decrypt it into RAM only while the tool runs:
 
 ```sh
 envvault dir init claude --path ~/.claude     # one-time: encrypt the dir, then empty it
-envvault dir run claude --harden -- claude     # decrypt into tmpfs, run, re-encrypt on exit
+envvault dir run claude --harden --sandbox --verify --allow ~/.ssh -- claude
 ```
+
+`dir run` takes the **same** hardening flags as env `run` — `--harden`,
+`--sandbox`, `--allow`, `--verify` — applied inside its private namespace, on top
+of the in-RAM file secret:
 
 - The decrypted contents live **only in a private, in-RAM tmpfs** at the original
   path, visible to this process tree alone — never on the host filesystem and not
@@ -752,6 +756,10 @@ envvault dir run claude --harden -- claude     # decrypt into tmpfs, run, re-enc
   `ptrace`/`/proc/<pid>/mem`).
 - **`--harden`** marks the consumer non-dumpable, so code *it* spawns in the same
   namespace can't core-dump or `ptrace` it to scrape the secret from memory.
+- **`--sandbox`/`--allow`** mask your other credential files for the session (only
+  `--allow`ed paths stay visible), exactly as in recipe A.
+- **`--verify`** checks your trust/config files against the root-owned baseline and
+  freezes the verified copy in, failing closed on tampering — exactly as in recipe A.
 - On exit the directory is re-encrypted; a `SIGKILL`/power loss costs at most the
   changes since the last autosave.
 
