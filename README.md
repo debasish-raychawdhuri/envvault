@@ -642,7 +642,28 @@ CA or proxy. You can't mask these (the tool needs them), and you can't env-scrub
 your way out (they're files, read directly).
 
 `run --verify` checks them against a **root-owned baseline** a same-uid attacker
-can't forge, and freezes the verified copy into the session:
+can't forge, and freezes the verified copy into the session.
+
+**How the baseline works — what you verify *against*.** `sudo envvault baseline
+set` reads each tracked file's current contents, BLAKE3-hashes them, and writes
+the `hash → path` list to `/etc/envvault/<user>.baseline` (owned `root:root`).
+That stored list is the reference: at launch, `--verify` re-hashes the files on
+disk and compares them to it; any difference → it refuses to run.
+
+Two consequences follow, and both matter:
+
+- **It's trust-on-first-use.** The baseline is a snapshot of the files *exactly as
+  they were the moment you ran `baseline set`*. If a file was already tampered
+  with then, you've hashed the tampering into the baseline and `--verify` will
+  pass it forever — garbage in, garbage out. **Run `baseline set` from a
+  known-good state** (fresh setup, before any untrusted code has touched those
+  files). Re-run it (or `baseline pin <path>`) only after a change *you* intended.
+- **Root-ownership protects the reference, not the contents.** Storing the
+  baseline as `root:root` doesn't make the snapshotted files trustworthy — it
+  stops a same-uid attacker from *rewriting the reference after the fact*. Without
+  it, an attacker would just edit the file **and** re-point the baseline to match,
+  and the check would pass. The files themselves stay writable; `--verify` doesn't
+  lock them — it makes any change **detectable** and refuses to run on a mismatch.
 
 ```sh
 # One-time (and after any intended change): bless the current state. Needs root,
