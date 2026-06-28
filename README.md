@@ -61,10 +61,10 @@ that actually needs them.
   password the file is useless — safe to back up, sync, even commit.
 - **In use**, the secret exists only in `envvault`'s memory (wiped on exit) and
   in the environment of the single child process you launched. It is never
-  exported into your interactive shell, so nothing else inherits it. (For
-  `run`, that one child's environment is still readable by a same-uid process
-  via `/proc/<pid>/environ` — an inherent limit of env injection. When a tool
-  can read its secret from a *file*, `dir run` removes even that exposure; see
+  exported into your interactive shell, so nothing else inherits it. (With plain
+  `run`, that one child's environment is readable by a same-uid process via
+  `/proc/<pid>/environ`; `run --harden` closes that on Linux, and `dir run`
+  avoids it entirely for tools that read a secret from a file — see
   [`run` vs `dir run`](#run-vs-dir-run-keeping-secrets-off-the-environment).)
 - **Nothing transient leaks**: no plaintext temp file, no shell-history line, no
   clipboard copy. You type a password, the program runs, the secret is gone.
@@ -197,9 +197,10 @@ one threat:
   `/proc/<pid>/cmdline`.)
 - **Smallest possible runtime window.** When you `run` a program, the secret is
   decrypted in memory and handed straight to that *one* child — never exported
-  into your shell, so nothing else inherits it. The process marks itself
-  non-dumpable so a same-uid attacker can't core-dump or `ptrace` it to scrape
-  the secret out of memory.
+  into your shell, so nothing else inherits it. While `envvault` itself holds a
+  decrypted secret it is non-dumpable, so a same-uid attacker can't core-dump or
+  `ptrace` *it*; `run --harden` and `dir run` extend that protection to the
+  launched program's own memory.
 - **No infrastructure.** One self-contained binary, one encrypted file per
   vault. No server to run, no account to create, no cloud KMS, no key
   distribution. Just a password and a file you can back up, sync, or even commit.
@@ -320,11 +321,14 @@ envvault unrun --hide ~/.config/some-tool -- ./suspicious-script
 | `show <name>`            | Print decrypted `KEY=VALUE` lines to stdout. |
 
 By default you are prompted for the vault password with no echo. Add
-`--password-stdin` to any command to read the password from stdin instead — for
+`--password-stdin` to read the vault password from stdin instead — for
 automation, e.g. `echo "$PW" | envvault run work --password-stdin -- ./deploy`.
-(`--password-stdin` isn't available on the interactive `edit`, `set`, and
-`passwd` commands, which need the terminal to prompt you — `edit` for the UI,
-`set` for each value, and `passwd` for the old and new passwords.)
+It's accepted by the commands that take a vault password: `init`, `edit`,
+`upgrade`, `run`, `rm`, `show`, and the `dir` subcommands (`edit` accepts it for
+the password, though the editor UI itself still needs a terminal). It is **not**
+on `set` or `passwd`, which read *secret values* / the *new* password
+interactively with no echo (`set` for each value, `passwd` for the old and new
+passwords).
 
 ### The interactive editor
 
@@ -351,20 +355,30 @@ read. See the caveat about clipboard managers under *Security notes* below.
 
 ## `run` vs `dir run`: keeping secrets off the environment
 
-`envvault run` is the convenient fallback, but it is the **weaker** of the two
-modes, and deliberately so — there is no way to make it stronger. It decrypts
-the secrets and `exec`s your program with them in its **environment**. From that
-moment until the program exits, any process running as you can read them from
-`/proc/<pid>/environ`.
+**Plain** `envvault run` is the convenient default but the weaker mode: it
+decrypts the secrets and `exec`s your program with them in its **environment**,
+where any process running as you can read them from `/proc/<pid>/environ` for the
+program's whole lifetime. `run` prints a one-line reminder of this on each use
+(silence it with `--quiet` or `ENVVAULT_QUIET=1`).
 
-This is **inherent to env injection, not a bug we can fix.** You might hope
-envvault could mark the program non-dumpable (`prctl(PR_SET_DUMPABLE, 0)`, which
-*does* block `/proc/<pid>/environ` reads) — but a normal `execve` resets the
-dumpable bit back to "dumpable" for any ordinary program, and envvault can't
-stop the target's own exec from doing that. The secret is exposed for the
-program's whole lifetime to exactly the same-uid attacker envvault exists to
-resist. `run` prints a one-line reminder of this on each use (silence it with
-`--quiet` or `ENVVAULT_QUIET=1`).
+envvault gives you two ways to remove that exposure — pick by how the program
+takes its secret:
+
+- **`run --harden`** (Linux) closes it for **env-only** tools: the secret never
+  enters the initial environment, and a preloaded shim marks the program
+  non-dumpable before it runs, so `/proc/<pid>/environ` *and* `/proc/<pid>/mem`
+  are both denied to a same-uid attacker. Dynamically-linked programs only; fails
+  closed otherwise. See
+  [Hardening env injection](#hardening-env-injection-run---harden-linux).
+- **`dir run`** is better still when the program reads its secret from a
+  **file**: the plaintext lives only on a namespace-private tmpfs and never
+  enters any environment at all.
+
+(A common misconception worth correcting: you might think a child's dumpable bit
+can't be controlled because `execve` resets it — true for a *plain* exec, which
+is why plain `run` is exposed. `--harden` works around it by re-setting
+non-dumpable from inside the program, in a preloaded constructor that runs before
+`main()`.)
 
 It's worth being clear where this sits relative to other tools, without
 overstating it. **The runtime exposure is not specific to envvault** — it is
@@ -636,9 +650,10 @@ program *and* to any code it runs.
   the tool root-proof: root can read any process's memory, any file, and any TTY
   regardless. A same-user attacker also retains other avenues it was never meant
   to block — replacing the `envvault` binary, logging your keystrokes, or reading
-  a launched program's environment (`/proc/<pid>/environ`) once `run` hands it the
-  secrets. Defending against an attacker who already executes code in your
-  session is fundamentally beyond what any userspace tool can guarantee.
+  a launched program's environment (`/proc/<pid>/environ`) once plain `run` hands
+  it the secrets (`run --harden` closes that specific avenue). Defending against
+  an attacker who already executes code in your session is fundamentally beyond
+  what any userspace tool can guarantee.
 - Memory zeroization is best-effort. Rust may move values before they are
   wiped, and while a value is *revealed* in the editor, transient per-frame
   copies inside the terminal library may be freed before being overwritten. The
@@ -666,11 +681,15 @@ program *and* to any code it runs.
   save on exit. So a `SIGKILL` or power loss costs at most the changes made
   since the last quiet moment — not the whole session. Ordinary exits, Ctrl-C,
   and `SIGTERM` always trigger a final re-encryption.
-- The namespace-private tmpfs hides the plaintext from *passive* same-uid
-  access, but not from a same-uid attacker who actively targets the running
-  child (e.g. `/proc/<child_pid>/root/`, `setns`). After `exec` the child is
-  dumpable again, and `PR_SET_DUMPABLE=0` only protects `envvault` itself, not
-  the tool it launches.
+- A `dir run` child runs in a private **user namespace**, so a same-uid attacker
+  *in the host* cannot `ptrace`, core-dump, or read `/proc/<child>/mem` of it
+  across the namespace boundary. What remains: code the program itself spawns
+  runs in the *same* namespace and, since a plainly-`exec`'d child is dumpable,
+  could dump its sibling/parent to scrape the secret from memory — use
+  **`dir run --harden`** to mark the program non-dumpable and close that.
+  (`envvault`'s own `PR_SET_DUMPABLE=0` protects the `envvault` process; the
+  child's protection comes from the namespace, plus its own non-dumpability under
+  `--harden`.)
 - Clearing the clipboard on paste is best-effort. A **clipboard manager**
   (KDE Klipper, GPaste, GNOME's clipboard history, etc.) may have already
   captured the secret when you *copied* it, and some are configured to restore
