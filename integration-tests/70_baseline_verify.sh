@@ -27,7 +27,9 @@ printf 'cert-bytes\n' > "$tdir/cert.db"
 
 # --- always: non-root guards ---
 out="$("$BIN" baseline set 2>&1)"; rc=$?
-if [ $rc -ne 0 ] && [[ "$out" == *"must run as root"* ]]; then pass "baseline set refused without root"; else fail "baseline set refused without root" "rc=$rc $out"; fi
+if [ $rc -ne 0 ] && [[ "$out" == *"requires root"* ]]; then pass "baseline set refused without root"; else fail "baseline set refused without root" "rc=$rc $out"; fi
+out="$("$BIN" baseline diff 2>&1)"; rc=$?
+if [ $rc -ne 0 ] && [[ "$out" == *"requires root"* ]]; then pass "baseline diff refused without root"; else fail "baseline diff refused without root" "rc=$rc $out"; fi
 
 # Ensure a clean slate so the no-baseline check is valid (only if we can).
 if have_sudo; then as_root rm -rf /etc/envvault; fi
@@ -131,6 +133,26 @@ out="$(echo "$PW" | "$BIN" dir run dv --password-stdin --sandbox --verify --hard
       bash -c "echo cfg=\$(cat '$tfile' | head -1); echo aws=\$(ls -A ~/.aws | wc -l)" 2>/dev/null)"
 assert_contains "dir compose: frozen config visible" "$out" "cfg=ca = local"
 assert_contains "dir compose: creds masked under sandbox" "$out" "aws=0"
+
+# ---- content snapshot (root-only 0400) + diff ----
+assert_eq "snapshot is root:root 0400" "$(stat -c '%U:%G:%a' "/etc/envvault/$U.snapshot" 2>/dev/null)" "root:root:400"
+if cat "/etc/envvault/$U.snapshot" >/dev/null 2>&1; then
+    fail "snapshot content unreadable to same-uid" "non-root could read it"
+else
+    pass "snapshot content unreadable to same-uid"
+fi
+
+# `baseline set` reports which file changed — names only, no content on screen
+printf 'ca = local\nproxy = http://changed-here\n' > "$tfile"
+out="$(as_root "$BIN" baseline set --user "$U" --add "$tfile" --add "$tdir" --add "$tabsent" 2>&1)"
+assert_contains "set reports the changed path" "$out" "$tfile"
+assert_not_contains "set hides content by default" "$out" "http://changed-here"
+
+# explicit diff (root) shows the line-level content — old AND new
+printf 'ca = local\nproxy = http://evil-proxy\n' > "$tfile"
+out="$(as_root "$BIN" baseline diff --user "$U" 2>&1)"
+assert_contains "baseline diff shows the new line" "$out" "http://evil-proxy"
+assert_contains "baseline diff shows the old line" "$out" "http://changed-here"
 
 # cleanup root state
 as_root rm -rf /etc/envvault

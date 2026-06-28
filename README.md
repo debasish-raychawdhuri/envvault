@@ -323,7 +323,8 @@ envvault unrun --hide ~/.config/some-tool -- ./suspicious-script
 | `baseline set`           | Record BLAKE3 hashes of your trust/config files into the root-owned baseline (**root**; `--add <path>`, `--user <login>`). |
 | `baseline pin <path>…`   | Add path(s) to the tracked set without re-blessing the rest (**root**). Re-pinning a tracked path re-blesses just it. |
 | `baseline unpin <path>…` | Remove path(s) from the tracked set (**root**); unpinning a directory drops everything under it. |
-| `baseline check` / `show`| Report any drift from the baseline / print it. |
+| `baseline check` / `show`| Report which paths drifted from the baseline (names) / print the baseline. |
+| `baseline diff`          | Show the line-level content diff of what drifted (**root** — the snapshot is root-only `0400`). `set --show-diff` shows it inline while re-blessing. |
 | `set <name> KEY …`       | Add/update keys; each value entered at a no-echo prompt, then the clipboard is wiped. |
 | `rename <old> <new>`     | Rename a vault. |
 | `rm <name> KEY …`        | Remove one or more keys. |
@@ -679,14 +680,31 @@ sudo envvault baseline pin ~/.config/foo/tls.conf   # start tracking a path
 sudo envvault baseline pin ~/.gitconfig             # re-pin to re-bless just it
 sudo envvault baseline unpin ~/.wgetrc              # stop tracking a path
 
-envvault baseline check                    # dry run: report any drift, no launch
-envvault baseline show                     # print the stored baseline
+envvault baseline check                    # which tracked paths drifted (names only)
+envvault baseline show                     # print the stored baseline (hashes)
+sudo envvault baseline diff                # show the line-level diff of what changed
 
 # At launch: re-hash each tracked path, FAIL CLOSED on any mismatch, and freeze
 # the verified bytes into the session so they can't change underneath the tool.
 envvault run work --verify -- claude
 envvault run work --sandbox --verify -- claude   # compose: mask secrets + verify config
 ```
+
+**Seeing *what* changed (the diff).** Alongside the hashes, `baseline set` also
+stores a plaintext copy of each tracked **text** file in
+`/etc/envvault/<user>.snapshot`, owned **`root:root 0400`** — readable only by
+root, i.e. only by whoever runs the baseline commands. There's no encryption and
+no extra password: viewing a diff already requires root, and root is outside the
+threat model (a same-uid attacker can't read a `0400` root file). With that:
+
+- `baseline set` prints *which paths* changed since the last baseline before
+  re-blessing — **names only**, so a shoulder-surfer never sees file contents.
+  Add `--show-diff` to also print the content diff.
+- `sudo envvault baseline diff` shows the line-level **old→new** diff of what
+  currently differs — the explicit, root-only way to inspect contents, so you can
+  judge "expected change" vs "tampering" before you re-bless.
+- `baseline check` (no root) still lists the drifted *filenames*; binary files
+  (e.g. cert DBs) are reported as "binary", never dumped.
 
 How it holds: the **BLAKE3 hash anchors integrity** (was the file clean when we
 started?) and the **mount namespace anchors time** (after the check, the verified

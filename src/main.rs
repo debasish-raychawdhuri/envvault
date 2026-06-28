@@ -174,6 +174,10 @@ enum BaselineCmd {
         /// User whose files to baseline (default: $SUDO_USER).
         #[arg(long)]
         user: Option<String>,
+        /// Also print the line-level content diff of what changed (off by
+        /// default so contents aren't shown to an onlooker).
+        #[arg(long)]
+        show_diff: bool,
     },
     /// Add path(s) to the tracked set, hashing them at their current state
     /// (root). Re-pinning an already-tracked path re-blesses just that path;
@@ -203,6 +207,12 @@ enum BaselineCmd {
     },
     /// Re-hash the tracked files and report any that differ from the baseline.
     Check {
+        #[arg(long)]
+        user: Option<String>,
+    },
+    /// Show the line-level content diff of what currently differs from the
+    /// baseline (requires root — the content snapshot is root-only 0400).
+    Diff {
         #[arg(long)]
         user: Option<String>,
     },
@@ -357,11 +367,12 @@ fn run_cli() -> Result<()> {
 
 fn run_baseline(command: BaselineCmd) -> Result<()> {
     match command {
-        BaselineCmd::Set { add, user } => cmd_baseline_set(&add, user.as_deref()),
+        BaselineCmd::Set { add, user, show_diff } => cmd_baseline_set(&add, user.as_deref(), show_diff),
         BaselineCmd::Pin { paths, user } => cmd_baseline_pin(&paths, user.as_deref()),
         BaselineCmd::Unpin { paths, user } => cmd_baseline_unpin(&paths, user.as_deref()),
         BaselineCmd::Show { user } => cmd_baseline_show(user.as_deref()),
         BaselineCmd::Check { user } => cmd_baseline_check(user.as_deref()),
+        BaselineCmd::Diff { user } => cmd_baseline_diff(user.as_deref()),
     }
 }
 
@@ -703,8 +714,8 @@ fn baseline_target(user: Option<&str>) -> Result<(String, std::path::PathBuf)> {
     #[cfg(unix)]
     if unsafe { libc::geteuid() } != 0 {
         bail!(
-            "editing the root-owned baseline under {} must run as root.\n\
-             Try: sudo envvault baseline <set|pin|unpin> …",
+            "accessing the root-owned baseline files under {} requires root.\n\
+             Try: sudo envvault baseline <set|pin|unpin|diff> …",
             integrity::BASELINE_DIR
         );
     }
@@ -729,9 +740,43 @@ fn entries(n: usize) -> &'static str {
     if n == 1 { "y" } else { "ies" }
 }
 
+/// Print which tracked paths changed (names only — never content).
+fn report_changes(c: &integrity::BaselineChanges) {
+    let dump = |label: &str, v: &[std::path::PathBuf]| {
+        if !v.is_empty() {
+            println!("  {label}:");
+            for p in v {
+                println!("    {}", p.display());
+            }
+        }
+    };
+    dump("changed", &c.changed);
+    dump("added", &c.added);
+    dump("removed", &c.removed);
+}
+
+/// Print the line-level content diff for each changed path (old snapshot vs new).
+/// Only called on an explicit opt-in (`set --show-diff` or `baseline diff`), since
+/// it puts file contents on screen.
+fn print_diffs(c: &integrity::BaselineChanges, old: &integrity::Snapshot, new: &integrity::Snapshot) {
+    let lossy = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+    for p in c.changed.iter().chain(&c.added).chain(&c.removed) {
+        println!("=== {} ===", p.display());
+        match (integrity::snapshot_get(old, p), integrity::snapshot_get(new, p)) {
+            (Some(o), Some(n)) => print!("{}", integrity::line_diff(&lossy(o), &lossy(n))),
+            (None, Some(n)) => print!("{}", integrity::line_diff("", &lossy(n))),
+            (Some(o), None) => print!("{}", integrity::line_diff(&lossy(o), "")),
+            (None, None) => println!("  (binary file — content not shown)"),
+        }
+    }
+}
+
 /// `sudo envvault baseline set` — record BLAKE3 hashes of the target user's
-/// trust/config set into the root-owned baseline (full re-bless). Must run as root.
-fn cmd_baseline_set(add: &[String], user: Option<&str>) -> Result<()> {
+/// trust/config set into the root-owned baseline (full re-bless), and store a
+/// root-only `0400` content snapshot for diffs. Must run as root. Reports which
+/// paths changed since the previous baseline (names only; `--show-diff` to also
+/// print the content diff).
+fn cmd_baseline_set(add: &[String], user: Option<&str>, show_diff: bool) -> Result<()> {
     let (target, home) = baseline_target(user)?;
     let mut tracked: Vec<std::path::PathBuf> = integrity::TRUST_CONFIG_PATHS
         .iter()
@@ -740,14 +785,57 @@ fn cmd_baseline_set(add: &[String], user: Option<&str>) -> Result<()> {
     for a in add {
         tracked.push(expand_under(&home, a));
     }
-    let baseline = integrity::compute(&tracked)?;
-    integrity::write(&target, &baseline)?;
+    let new_baseline = integrity::compute(&tracked)?;
+    let new_snap = integrity::collect_snapshot(&tracked)?;
+
+    // Report what's about to change vs the previous baseline, so a re-bless is
+    // never silent. Names by default; content only with --show-diff.
+    if let Ok(old_baseline) = integrity::read(&target) {
+        let changes = integrity::diff_baselines(&old_baseline, &new_baseline);
+        if changes.is_empty() {
+            println!("No changes since the last baseline for '{target}'.");
+        } else {
+            println!("Changes since the last baseline for '{target}':");
+            report_changes(&changes);
+            if show_diff {
+                let old_snap = integrity::read_snapshot(&target).unwrap_or_default();
+                println!();
+                print_diffs(&changes, &old_snap, &new_snap);
+            } else {
+                println!("  (re-run with --show-diff to see the content changes)");
+            }
+        }
+    }
+
+    integrity::write(&target, &new_baseline)?;
+    integrity::write_snapshot(&target, &new_snap)?;
     println!(
         "Wrote integrity baseline for user '{target}' to {} ({} tracked entr{}).",
         integrity::baseline_path(&target).display(),
-        baseline.len(),
-        entries(baseline.len())
+        new_baseline.len(),
+        entries(new_baseline.len())
     );
+    Ok(())
+}
+
+/// `sudo envvault baseline diff` — show the line-level content diff of what
+/// currently differs from the baseline. Root-only (the snapshot is `0400`).
+fn cmd_baseline_diff(user: Option<&str>) -> Result<()> {
+    let (target, _home) = baseline_target(user)?;
+    let old_baseline = integrity::read(&target)?;
+    let old_snap = integrity::read_snapshot(&target)?;
+    let roots = old_baseline.tracked_roots();
+    let cur_baseline = integrity::compute(&roots)?;
+    let cur_snap = integrity::collect_snapshot(&roots)?;
+    let changes = integrity::diff_baselines(&old_baseline, &cur_baseline);
+    if changes.is_empty() {
+        println!("No changes — the tracked files match the baseline for '{target}'.");
+        return Ok(());
+    }
+    println!("Files that differ from the baseline for '{target}':");
+    report_changes(&changes);
+    println!();
+    print_diffs(&changes, &old_snap, &cur_snap);
     Ok(())
 }
 
@@ -769,6 +857,14 @@ fn cmd_baseline_pin(paths: &[String], user: Option<&str>) -> Result<()> {
         bail!("nothing to pin (every path given was already covered by a tracked directory)");
     }
     integrity::write(&target, &baseline)?;
+    // Keep the content snapshot in sync, surgically: replace only the pinned
+    // paths' content, leave the rest as previously blessed.
+    let pinned: Vec<std::path::PathBuf> = rep.added.iter().chain(&rep.repinned).cloned().collect();
+    let mut snap = integrity::read_snapshot(&target).unwrap_or_default();
+    snap.retain(|(p, _)| !pinned.iter().any(|pp| p == pp || p.starts_with(pp)));
+    snap.extend(integrity::collect_snapshot(&pinned)?);
+    snap.sort_by(|a, b| a.0.cmp(&b.0));
+    integrity::write_snapshot(&target, &snap)?;
     println!(
         "Pinned for '{target}': {} added, {} re-blessed — {} tracked entr{} total.",
         rep.added.len(),
@@ -796,6 +892,10 @@ fn cmd_baseline_unpin(paths: &[String], user: Option<&str>) -> Result<()> {
         bail!("nothing removed — none of the given paths were tracked");
     }
     integrity::write(&target, &baseline)?;
+    // Drop the unpinned paths from the content snapshot too.
+    let mut snap = integrity::read_snapshot(&target).unwrap_or_default();
+    snap.retain(|(p, _)| !rep.removed.iter().any(|pp| p == pp || p.starts_with(pp)));
+    integrity::write_snapshot(&target, &snap)?;
     println!(
         "Unpinned for '{target}': {} removed — {} tracked entr{} remain.",
         rep.removed.len(),
@@ -847,6 +947,7 @@ fn cmd_baseline_check(user: Option<&str>) -> Result<()> {
     for p in &problems {
         println!("MISMATCH: {p}");
     }
+    eprintln!("Run `sudo envvault baseline diff` to see the line-level changes.");
     bail!(
         "{} tracked path(s) differ from the baseline. If the changes are intended, \
          re-bless with `sudo envvault baseline set`.",

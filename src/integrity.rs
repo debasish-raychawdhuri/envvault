@@ -193,6 +193,16 @@ impl Baseline {
         })
     }
 
+    /// The top-level tracked paths: directory roots, standalone files, and
+    /// absent paths (used to recompute current state for `baseline diff`).
+    pub fn tracked_roots(&self) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = Vec::new();
+        v.extend(self.dirs.iter().map(|d| d.path.clone()));
+        v.extend(self.files.iter().map(|f| f.path.clone()));
+        v.extend(self.absent.iter().cloned());
+        v
+    }
+
     /// Whether `p` is a top-level tracked path.
     pub fn tracks(&self, p: &Path) -> bool {
         self.dirs.iter().any(|d| d.path == p)
@@ -400,6 +410,253 @@ pub fn compute(tracked: &[PathBuf]) -> Result<Baseline> {
         dirs,
         absent,
     })
+}
+
+// ===== Content snapshots (root-only 0400) and diffs ==========================
+//
+// To show *what* changed on a mismatch — not just which file — we keep a
+// plaintext copy of each tracked TEXT file alongside the hash baseline, in
+// `/etc/envvault/<user>.snapshot`, `root:root 0400`. A same-uid attacker (the
+// threat model) can't read it; only root can, which is exactly who runs the
+// baseline commands. No encryption: viewing a diff already requires root, and
+// root is out of scope. Binary files are not snapshotted (diffed as "binary").
+
+/// Per-file contents for diffing. Held in `Zeroizing` since a tracked file may
+/// carry secrets (e.g. `~/.netrc`).
+pub type Snapshot = Vec<(PathBuf, Zeroizing<Vec<u8>>)>;
+
+/// `/etc/envvault/<user>.snapshot`.
+pub fn snapshot_path(user: &str) -> PathBuf {
+    Path::new(BASELINE_DIR).join(format!("{user}.snapshot"))
+}
+
+/// Heuristic: text if it is valid UTF-8 with no NUL byte. (We only diff text;
+/// binary files like cert DBs are reported as "binary differs".)
+fn is_text(bytes: &[u8]) -> bool {
+    !bytes.contains(&0) && std::str::from_utf8(bytes).is_ok()
+}
+
+/// Collect the contents of every tracked **text** file (mirrors `compute`'s walk).
+pub fn collect_snapshot(tracked: &[PathBuf]) -> Result<Snapshot> {
+    let mut out: Snapshot = Vec::new();
+    for abs in tracked {
+        match std::fs::metadata(abs) {
+            Err(_) => {} // absent — nothing to snapshot
+            Ok(m) if m.is_dir() => {
+                let mut files = Vec::new();
+                collect_dir_files(abs, &mut files)?;
+                for (p, b) in files {
+                    if is_text(&b) {
+                        out.push((p, b));
+                    }
+                }
+            }
+            Ok(m) if m.is_file() => {
+                let b = read_capped(abs)?;
+                if is_text(&b) {
+                    out.push((abs.clone(), b));
+                }
+            }
+            Ok(_) => {}
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
+/// Look up a path's snapshotted content.
+pub fn snapshot_get<'a>(snap: &'a Snapshot, path: &Path) -> Option<&'a [u8]> {
+    snap.iter().find(|(p, _)| p == path).map(|(_, c)| c.as_slice())
+}
+
+/// Serialize a snapshot: repeated `[u32 path_len | path-utf8 | u64 len | bytes]`.
+fn serialize_snapshot(snap: &Snapshot) -> Vec<u8> {
+    let mut buf = Vec::new();
+    for (p, c) in snap {
+        let pb = p.to_string_lossy();
+        let pb = pb.as_bytes();
+        buf.extend_from_slice(&(pb.len() as u32).to_le_bytes());
+        buf.extend_from_slice(pb);
+        buf.extend_from_slice(&(c.len() as u64).to_le_bytes());
+        buf.extend_from_slice(c);
+    }
+    buf
+}
+
+fn parse_snapshot(bytes: &[u8]) -> Result<Snapshot> {
+    let mut out: Snapshot = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let need = |i: usize, n: usize| -> Result<()> {
+            if i + n > bytes.len() {
+                bail!("truncated snapshot file");
+            }
+            Ok(())
+        };
+        need(i, 4)?;
+        let plen = u32::from_le_bytes(bytes[i..i + 4].try_into().unwrap()) as usize;
+        i += 4;
+        need(i, plen)?;
+        let path = PathBuf::from(String::from_utf8_lossy(&bytes[i..i + plen]).into_owned());
+        i += plen;
+        need(i, 8)?;
+        let clen = u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap()) as usize;
+        i += 8;
+        need(i, clen)?;
+        out.push((path, Zeroizing::new(bytes[i..i + clen].to_vec())));
+        i += clen;
+    }
+    Ok(out)
+}
+
+/// Write the snapshot `root:root 0400` (root-only). Journaled like [`write`].
+#[cfg(unix)]
+pub fn write_snapshot(user: &str, snap: &Snapshot) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if !valid_user(user) {
+        bail!("invalid user name {user:?}");
+    }
+    let dir = Path::new(BASELINE_DIR);
+    std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755));
+    let final_path = snapshot_path(user);
+    let tmp = dir.join(format!(".{user}.snapshot.tmp.{}", std::process::id()));
+    std::fs::write(&tmp, serialize_snapshot(snap))
+        .with_context(|| format!("failed to write {}", tmp.display()))?;
+    let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o400));
+    if let Ok(f) = std::fs::File::open(&tmp) {
+        let _ = f.sync_all();
+    }
+    std::fs::rename(&tmp, &final_path)
+        .with_context(|| format!("failed to install {}", final_path.display()))?;
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn write_snapshot(_user: &str, _snap: &Snapshot) -> Result<()> {
+    bail!("snapshots are only supported on Unix-like systems");
+}
+
+/// Read the snapshot for `user`. A non-root caller gets permission-denied (0400
+/// root) — that denial is the gate keeping content out of same-uid reach.
+pub fn read_snapshot(user: &str) -> Result<Snapshot> {
+    if !valid_user(user) {
+        bail!("invalid user name {user:?}");
+    }
+    let path = snapshot_path(user);
+    let bytes = std::fs::read(&path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => anyhow::anyhow!(
+            "no snapshot for user '{user}' at {} — run `sudo envvault baseline set`",
+            path.display()
+        ),
+        std::io::ErrorKind::PermissionDenied => anyhow::anyhow!(
+            "{} is root-only (0400); run this as root (sudo) to read the diff",
+            path.display()
+        ),
+        _ => anyhow::Error::new(e).context(format!("failed to read {}", path.display())),
+    })?;
+    parse_snapshot(&bytes)
+}
+
+/// What changed between two baselines, as absolute paths.
+pub struct BaselineChanges {
+    pub added: Vec<PathBuf>,
+    pub removed: Vec<PathBuf>,
+    pub changed: Vec<PathBuf>,
+}
+
+impl BaselineChanges {
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty() && self.changed.is_empty()
+    }
+}
+
+impl Baseline {
+    /// Flatten to `path → Some(hash)` (a tracked file) or `None` (tracked-absent).
+    fn hash_map(&self) -> std::collections::BTreeMap<PathBuf, Option<String>> {
+        let mut m = std::collections::BTreeMap::new();
+        for fe in &self.files {
+            m.insert(fe.path.clone(), Some(fe.hash.clone()));
+        }
+        for g in &self.dirs {
+            for fe in &g.files {
+                m.insert(fe.path.clone(), Some(fe.hash.clone()));
+            }
+        }
+        for p in &self.absent {
+            m.insert(p.clone(), None);
+        }
+        m
+    }
+}
+
+/// Compare `old` to `new`: paths that appeared, disappeared, or whose hash moved.
+pub fn diff_baselines(old: &Baseline, new: &Baseline) -> BaselineChanges {
+    let (om, nm) = (old.hash_map(), new.hash_map());
+    let mut c = BaselineChanges {
+        added: Vec::new(),
+        removed: Vec::new(),
+        changed: Vec::new(),
+    };
+    for (p, nv) in &nm {
+        match om.get(p) {
+            None => c.added.push(p.clone()),
+            Some(ov) if ov != nv => c.changed.push(p.clone()),
+            _ => {}
+        }
+    }
+    for p in om.keys() {
+        if !nm.contains_key(p) {
+            c.removed.push(p.clone());
+        }
+    }
+    c
+}
+
+/// A compact LCS line diff: `- ` lines are only in `old`, `+ ` only in `new`,
+/// `  ` are common context. O(n·m); falls back to a note for very large inputs.
+pub fn line_diff(old: &str, new: &str) -> String {
+    let a: Vec<&str> = old.lines().collect();
+    let b: Vec<&str> = new.lines().collect();
+    let (n, m) = (a.len(), b.len());
+    if n.saturating_mul(m) > 4_000_000 {
+        return format!("(too large to diff: {n} vs {m} lines)\n");
+    }
+    let mut dp = vec![vec![0u32; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            dp[i][j] = if a[i] == b[j] {
+                dp[i + 1][j + 1] + 1
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
+        }
+    }
+    let mut out = String::new();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < n && j < m {
+        if a[i] == b[j] {
+            out.push_str(&format!("  {}\n", a[i]));
+            i += 1;
+            j += 1;
+        } else if dp[i + 1][j] >= dp[i][j + 1] {
+            out.push_str(&format!("- {}\n", a[i]));
+            i += 1;
+        } else {
+            out.push_str(&format!("+ {}\n", b[j]));
+            j += 1;
+        }
+    }
+    for k in i..n {
+        out.push_str(&format!("- {}\n", a[k]));
+    }
+    for k in j..m {
+        out.push_str(&format!("+ {}\n", b[k]));
+    }
+    out
 }
 
 /// Validate a user name used to build a baseline file path, refusing anything
@@ -743,6 +1000,67 @@ mod tests {
         let (base, rep) = unpin(base, &[pki.clone()]);
         assert_eq!(rep.removed, vec![pki.clone()]);
         assert_eq!(base.len(), 0, "dir and all its children gone");
+    }
+
+    #[test]
+    fn line_diff_marks_changes() {
+        let d = line_diff("a\nb\nc\n", "a\nB\nc\n");
+        assert!(d.contains("  a"), "unchanged line is context: {d}");
+        assert!(d.contains("- b"), "old line removed: {d}");
+        assert!(d.contains("+ B"), "new line added: {d}");
+        assert!(d.contains("  c"), "trailing context: {d}");
+        // identical inputs → all context, no -/+
+        let same = line_diff("x\ny\n", "x\ny\n");
+        assert!(!same.contains("- ") && !same.contains("+ "), "no diff markers: {same}");
+    }
+
+    #[test]
+    fn snapshot_serialize_parse_roundtrip() {
+        let snap: Snapshot = vec![
+            (PathBuf::from("/a/b.conf"), Zeroizing::new(b"line1\nline2\n".to_vec())),
+            (PathBuf::from("/c/d.conf"), Zeroizing::new(b"".to_vec())),
+        ];
+        let bytes = serialize_snapshot(&snap);
+        let back = parse_snapshot(&bytes).unwrap();
+        assert_eq!(back.len(), 2);
+        assert_eq!(back[0].0, PathBuf::from("/a/b.conf"));
+        assert_eq!(&*back[0].1, b"line1\nline2\n");
+        assert_eq!(&*back[1].1, b"");
+        assert!(parse_snapshot(b"\xff\xff\xff\xff").is_err(), "truncated → error");
+    }
+
+    #[test]
+    fn collect_snapshot_skips_binary() {
+        let home = tmp("snap");
+        std::fs::write(home.join("text.conf"), b"hello\n").unwrap();
+        std::fs::write(home.join("blob.bin"), b"\x00\x01\x02bin").unwrap();
+        let snap = collect_snapshot(&[home.join("text.conf"), home.join("blob.bin")]).unwrap();
+        assert_eq!(snap.len(), 1, "only the text file is snapshotted");
+        assert_eq!(snap[0].0, home.join("text.conf"));
+    }
+
+    #[test]
+    fn diff_baselines_detects_add_remove_change() {
+        // Use a tracked directory so we get genuine added/removed/changed:
+        // a brand-new file is "added"; a vanished one "removed"; an edited one
+        // "changed". (A top-level path going absent↔present is "changed", since
+        // it was already tracked — covered implicitly here.)
+        let home = tmp("dbl");
+        let dir = home.join("d");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("x"), b"1").unwrap();
+        std::fs::write(dir.join("z"), b"zz").unwrap();
+        let old = compute(&[dir.clone()]).unwrap();
+
+        std::fs::write(dir.join("x"), b"1x").unwrap(); // changed
+        std::fs::write(dir.join("y"), b"new").unwrap(); // added
+        std::fs::remove_file(dir.join("z")).unwrap(); // removed
+        let new = compute(&[dir.clone()]).unwrap();
+
+        let c = diff_baselines(&old, &new);
+        assert!(c.changed.contains(&dir.join("x")), "x changed: {:?}", c.changed);
+        assert!(c.added.contains(&dir.join("y")), "y added: {:?}", c.added);
+        assert!(c.removed.contains(&dir.join("z")), "z removed: {:?}", c.removed);
     }
 
     #[test]

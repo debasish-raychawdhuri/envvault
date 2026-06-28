@@ -16,9 +16,9 @@ shows() { as_root "$BIN" baseline show --user "$U" 2>/dev/null | grep -qF "$1"; 
 
 # --- always: non-root guard ---
 out="$("$BIN" baseline pin "$A" 2>&1)"; rc=$?
-if [ $rc -ne 0 ] && [[ "$out" == *"must run as root"* ]]; then pass "pin refused without root"; else fail "pin refused without root" "rc=$rc $out"; fi
+if [ $rc -ne 0 ] && [[ "$out" == *"requires root"* ]]; then pass "pin refused without root"; else fail "pin refused without root" "rc=$rc $out"; fi
 out="$("$BIN" baseline unpin "$A" 2>&1)"; rc=$?
-if [ $rc -ne 0 ] && [[ "$out" == *"must run as root"* ]]; then pass "unpin refused without root"; else fail "unpin refused without root" "rc=$rc $out"; fi
+if [ $rc -ne 0 ] && [[ "$out" == *"requires root"* ]]; then pass "unpin refused without root"; else fail "unpin refused without root" "rc=$rc $out"; fi
 
 # --- root-only ---
 # NB: these files are executed (not sourced), so use `exit`, not `return`.
