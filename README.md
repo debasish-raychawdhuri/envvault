@@ -616,14 +616,20 @@ program *and* to any code it runs.
   suggestions. It's advisory: a weak password is reported, never rejected.
 - `show` and the editor's "reveal" deliberately display secrets on screen — use
   them intentionally.
-- **`run` (env injection) cannot be secured against a same-uid attacker.** Once
-  a secret is handed to a child via its environment it is readable through
-  `/proc/<pid>/environ` for that program's whole lifetime, and there is no fix:
-  a normal `execve` resets the child's dumpable bit, so it can't be hidden the
-  way `envvault` hides itself. `envvault` only controls how the secret gets
-  there, not what the program does with it afterward. Prefer `dir run` for
-  file-based secrets — see
-  [`run` vs `dir run`](#run-vs-dir-run-keeping-secrets-off-the-environment).
+- **Plain `run` (env injection) exposes the secret to a same-uid attacker.** Once
+  a secret is in a child's environment it is readable through `/proc/<pid>/environ`
+  for that program's whole lifetime: a normal `execve` leaves the child dumpable,
+  so — unlike `envvault` itself — it isn't hidden. Plain `run` only controls how
+  the secret gets there, not what the program does with it afterward.
+  - **`run --harden` closes this** (Linux, dynamically-linked programs): the
+    secret is *not* placed in the initial environment, and a preloaded shim marks
+    the child non-dumpable before `main()` and pulls the secret in over a pipe —
+    so `/proc/<pid>/environ` and `/proc/<pid>/mem` are both denied to a same-uid
+    attacker. It **fails closed** if the shim can't load (static/setuid binary).
+    See [Hardening env injection](#hardening-env-injection-run---harden-linux).
+  - For tools that read a secret from a *file*, prefer `dir run` (optionally
+    `dir run --harden` to also make the consumer non-dumpable) — see
+    [`run` vs `dir run`](#run-vs-dir-run-keeping-secrets-off-the-environment).
 - `envvault` protects secrets *at rest* and limits their *exposure at runtime*.
   Marking the process non-dumpable stops a *same-user* attacker from core-dumping
   or debugging **the `envvault` process** to read its memory, but it does not make
