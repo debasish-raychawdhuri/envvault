@@ -8,6 +8,7 @@
 mod crypto;
 mod dirvault;
 mod harden;
+mod integrity;
 mod password;
 mod run;
 mod sandbox;
@@ -98,6 +99,12 @@ enum Cmd {
         /// (repeatable); implies --sandbox. Nested `unrun` inherits these.
         #[arg(long)]
         allow: Vec<String>,
+        /// Linux: verify your config/trust files (~/.gitconfig, ~/.npmrc,
+        /// ~/.pki, …) against the root-owned baseline and freeze the verified
+        /// copy into the session. Fails closed on any mismatch. Requires a
+        /// baseline (`sudo envvault baseline set`).
+        #[arg(long)]
+        verify: bool,
         /// The program to run, followed by its arguments (use `--` first).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true, num_args = 1..)]
         command: Vec<String>,
@@ -144,6 +151,39 @@ enum Cmd {
     Dir {
         #[command(subcommand)]
         command: DirCmd,
+    },
+    /// Manage the root-owned config-integrity baseline used by `run --verify`.
+    /// It records BLAKE3 hashes of your trust/config files (~/.gitconfig,
+    /// ~/.npmrc, ~/.pki, …) somewhere a same-uid attacker can't forge, so
+    /// poisoning is detected and the verified copy frozen for the session.
+    Baseline {
+        #[command(subcommand)]
+        command: BaselineCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum BaselineCmd {
+    /// Record BLAKE3 hashes of the tracked trust/config set into the root-owned
+    /// baseline (requires root — run with sudo). Re-run to re-bless after an
+    /// intended change.
+    Set {
+        /// Extra path to track, on top of the built-in trust set (repeatable).
+        #[arg(long)]
+        add: Vec<String>,
+        /// User whose files to baseline (default: $SUDO_USER).
+        #[arg(long)]
+        user: Option<String>,
+    },
+    /// Print the stored baseline for a user (default: you).
+    Show {
+        #[arg(long)]
+        user: Option<String>,
+    },
+    /// Re-hash the tracked files and report any that differ from the baseline.
+    Check {
+        #[arg(long)]
+        user: Option<String>,
     },
 }
 
@@ -252,8 +292,18 @@ fn run_cli() -> Result<()> {
             harden,
             sandbox,
             allow,
+            verify,
             command,
-        } => cmd_run(&name, password_stdin, quiet, harden, sandbox, &allow, &command),
+        } => cmd_run(
+            &name,
+            password_stdin,
+            quiet,
+            harden,
+            sandbox,
+            &allow,
+            verify,
+            &command,
+        ),
         Cmd::Unrun { hide, command } => cmd_unrun(&hide, &command),
         Cmd::Set { name, keys } => cmd_set(&name, &keys),
         Cmd::Rm {
@@ -267,6 +317,15 @@ fn run_cli() -> Result<()> {
         } => cmd_show(&name, password_stdin),
         Cmd::List => cmd_list(),
         Cmd::Dir { command } => run_dir(command),
+        Cmd::Baseline { command } => run_baseline(command),
+    }
+}
+
+fn run_baseline(command: BaselineCmd) -> Result<()> {
+    match command {
+        BaselineCmd::Set { add, user } => cmd_baseline_set(&add, user.as_deref()),
+        BaselineCmd::Show { user } => cmd_baseline_show(user.as_deref()),
+        BaselineCmd::Check { user } => cmd_baseline_check(user.as_deref()),
     }
 }
 
@@ -524,6 +583,154 @@ fn inherited_allow() -> Vec<std::path::PathBuf> {
         .unwrap_or_default()
 }
 
+/// Resolve the invoking (effective) user's login name via the passwd database,
+/// not `$USER` — env vars are same-uid-spoofable and we use this to locate the
+/// trusted baseline.
+#[cfg(unix)]
+fn current_user() -> Result<String> {
+    let uid = unsafe { libc::geteuid() };
+    unsafe {
+        let pw = libc::getpwuid(uid);
+        if pw.is_null() {
+            bail!("could not resolve a login name for uid {uid}");
+        }
+        Ok(std::ffi::CStr::from_ptr((*pw).pw_name)
+            .to_string_lossy()
+            .into_owned())
+    }
+}
+
+#[cfg(not(unix))]
+fn current_user() -> Result<String> {
+    bail!("the integrity baseline is only supported on Unix-like systems");
+}
+
+/// The home directory of `user` from the passwd database. Used by `baseline set`
+/// (running as root) to find the *target* user's files — `$HOME`/`dirs` would
+/// return root's home under sudo.
+#[cfg(unix)]
+fn home_for_user(user: &str) -> Result<std::path::PathBuf> {
+    let c = std::ffi::CString::new(user).context("user name has a NUL byte")?;
+    unsafe {
+        let pw = libc::getpwnam(c.as_ptr());
+        if pw.is_null() {
+            bail!("no such user '{user}'");
+        }
+        let dir = std::ffi::CStr::from_ptr((*pw).pw_dir).to_string_lossy();
+        if dir.is_empty() {
+            bail!("user '{user}' has no home directory");
+        }
+        Ok(std::path::PathBuf::from(dir.into_owned()))
+    }
+}
+
+#[cfg(not(unix))]
+fn home_for_user(_user: &str) -> Result<std::path::PathBuf> {
+    bail!("the integrity baseline is only supported on Unix-like systems");
+}
+
+/// Expand a leading `~/` against a *specific* home (the baselined user's),
+/// otherwise take the path as-is. Like `normalize_path` but home-explicit, since
+/// `baseline set` runs as root and must not use root's home.
+fn expand_under(home: &Path, s: &str) -> std::path::PathBuf {
+    if let Some(rest) = s.strip_prefix("~/") {
+        home.join(rest)
+    } else {
+        std::path::PathBuf::from(s)
+    }
+}
+
+/// `sudo envvault baseline set` — record BLAKE3 hashes of the target user's
+/// trust/config set into the root-owned baseline. Must run as root.
+fn cmd_baseline_set(add: &[String], user: Option<&str>) -> Result<()> {
+    #[cfg(unix)]
+    if unsafe { libc::geteuid() } != 0 {
+        bail!(
+            "`baseline set` writes the root-owned baseline under {} and must run as root.\n\
+             Try: sudo envvault baseline set",
+            integrity::BASELINE_DIR
+        );
+    }
+    let target = match user {
+        Some(u) => u.to_string(),
+        None => std::env::var("SUDO_USER").map_err(|_| {
+            anyhow::anyhow!(
+                "could not determine whose files to baseline; pass --user <login> \
+                 (running directly as root, $SUDO_USER is unset)"
+            )
+        })?,
+    };
+    if target == "root" {
+        bail!("refusing to baseline root's home; pass --user <your-login>");
+    }
+    let home = home_for_user(&target)?;
+    let mut tracked: Vec<std::path::PathBuf> = integrity::TRUST_CONFIG_PATHS
+        .iter()
+        .map(|rel| home.join(rel))
+        .collect();
+    for a in add {
+        tracked.push(expand_under(&home, a));
+    }
+    let baseline = integrity::compute(&tracked)?;
+    integrity::write(&target, &baseline)?;
+    println!(
+        "Wrote integrity baseline for user '{target}' to {} ({} tracked entr{}).",
+        integrity::baseline_path(&target).display(),
+        baseline.len(),
+        if baseline.len() == 1 { "y" } else { "ies" }
+    );
+    Ok(())
+}
+
+/// `envvault baseline show` — print the stored baseline (plain text).
+fn cmd_baseline_show(user: Option<&str>) -> Result<()> {
+    let target = match user {
+        Some(u) => u.to_string(),
+        None => current_user()?,
+    };
+    let path = integrity::baseline_path(&target);
+    let text = std::fs::read_to_string(&path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            anyhow::anyhow!(
+                "no integrity baseline for user '{target}' at {}.\n\
+                 Create one with: sudo envvault baseline set",
+                path.display()
+            )
+        } else {
+            anyhow::Error::new(e).context(format!("failed to read {}", path.display()))
+        }
+    })?;
+    print!("{text}");
+    Ok(())
+}
+
+/// `envvault baseline check` — re-hash the tracked files and report any drift,
+/// without running anything (a dry run of what `run --verify` would enforce).
+fn cmd_baseline_check(user: Option<&str>) -> Result<()> {
+    let target = match user {
+        Some(u) => u.to_string(),
+        None => current_user()?,
+    };
+    let baseline = integrity::read(&target)?;
+    let problems = integrity::check(&baseline);
+    if problems.is_empty() {
+        println!(
+            "baseline OK: all {} tracked entr{} match.",
+            baseline.len(),
+            if baseline.len() == 1 { "y" } else { "ies" }
+        );
+        return Ok(());
+    }
+    for p in &problems {
+        println!("MISMATCH: {p}");
+    }
+    bail!(
+        "{} tracked path(s) differ from the baseline. If the changes are intended, \
+         re-bless with `sudo envvault baseline set`.",
+        problems.len()
+    );
+}
+
 fn cmd_unrun(extra_hide: &[String], command: &[String]) -> Result<()> {
     let allow = inherited_allow();
     let mut paths: Vec<std::path::PathBuf> = default_cred_paths()
@@ -546,6 +753,7 @@ fn cmd_run(
     harden: bool,
     sandbox: bool,
     allow: &[String],
+    verify: bool,
     command: &[String],
 ) -> Result<()> {
     let path = resolve_existing(name)?;
@@ -554,32 +762,48 @@ fn cmd_run(
         .expect("clap guarantees at least one element");
     let quiet = quiet || std::env::var_os("ENVVAULT_QUIET").is_some();
 
-    // --allow implies --sandbox.
-    if sandbox || !allow.is_empty() {
+    // Any of --sandbox, --allow (implies --sandbox), or --verify needs the
+    // private namespace established before any untrusted code runs.
+    let need_ns = sandbox || !allow.is_empty() || verify;
+    if need_ns {
         let allow: Vec<std::path::PathBuf> = allow.iter().map(|s| normalize_path(s)).collect();
-        // 1. Enter the masked namespace BEFORE decrypting, so no secret is in
-        //    memory during the brief dumpable id-map window.
+        // 1. Enter the namespace BEFORE decrypting, so no secret is in memory
+        //    during the brief dumpable id-map window.
         sandbox::enter_user_mount_ns()?;
         // 2. Decrypt now (still non-dumpable; the vault dir is still visible).
         let (_session, vault) = open_vault(&path, password_stdin)?;
-        // 3. Structurally hide every default credential path except the allowed
-        //    ones — the hard boundary, set before any untrusted code runs.
-        let mask: Vec<std::path::PathBuf> = default_cred_paths()
-            .into_iter()
-            .filter(|p| !allow.contains(p))
-            .collect();
-        sandbox::mask_paths(&mask)?;
-        // 4. Export the (soft) allow-list so a nested `unrun` won't re-hide the
-        //    paths the human chose to leave visible.
-        let allow_env = allow
-            .iter()
-            .filter_map(|p| p.to_str())
-            .collect::<Vec<_>>()
-            .join(":");
-        // SAFETY: single-threaded here, before any child is spawned.
-        unsafe { std::env::set_var("ENVVAULT_ALLOW", allow_env) };
-        // 5. Run inside the masked namespace (exec, or fork under --harden); the
-        //    child inherits the namespace and every mask.
+        // 3. With --verify: check the config/trust files against the root-owned
+        //    baseline (fails closed on any mismatch) and freeze the verified
+        //    copy into the session. Frozen paths are recorded so they aren't
+        //    also masked below (freeze wins for shared paths like ~/.npmrc).
+        let mut frozen: Vec<std::path::PathBuf> = Vec::new();
+        if verify {
+            let user = current_user()?;
+            let baseline = integrity::read(&user)?;
+            let items = integrity::verify_and_collect(&baseline)?;
+            frozen = items.iter().map(|i| i.path().to_path_buf()).collect();
+            sandbox::freeze_items(&items)?;
+        }
+        // 4. With --sandbox/--allow: structurally hide every default credential
+        //    path except the allowed (and frozen) ones — the hard boundary.
+        if sandbox || !allow.is_empty() {
+            let mask: Vec<std::path::PathBuf> = default_cred_paths()
+                .into_iter()
+                .filter(|p| !allow.contains(p) && !frozen.contains(p))
+                .collect();
+            sandbox::mask_paths(&mask)?;
+            // Export the (soft) allow-list so a nested `unrun` won't re-hide the
+            // paths the human chose to leave visible.
+            let allow_env = allow
+                .iter()
+                .filter_map(|p| p.to_str())
+                .collect::<Vec<_>>()
+                .join(":");
+            // SAFETY: single-threaded here, before any child is spawned.
+            unsafe { std::env::set_var("ENVVAULT_ALLOW", allow_env) };
+        }
+        // 5. Run inside the namespace (exec, or fork under --harden); the child
+        //    inherits the namespace, every mask, and every frozen file.
         return run::run(&vault, program, args, quiet, harden);
     }
 

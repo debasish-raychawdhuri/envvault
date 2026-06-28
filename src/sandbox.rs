@@ -113,6 +113,22 @@ pub fn mask_paths(_paths: &[std::path::PathBuf]) -> Result<()> {
     anyhow::bail!("credential sandboxing is only supported on Linux.")
 }
 
+/// Freeze each verified config/trust item into the current mount namespace (call
+/// after `enter_user_mount_ns`): bind the verified bytes of a file over its path,
+/// re-materialize a verified directory tree in a fresh tmpfs, and neutralize a
+/// path that should be absent. The bound content can no longer change underneath
+/// the program — a same-uid attacker outside the namespace writes under the mount
+/// and is shadowed. Linux only. See `crate::integrity`.
+#[cfg(target_os = "linux")]
+pub fn freeze_items(items: &[crate::integrity::FrozenItem]) -> Result<()> {
+    linux::freeze_items(items)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn freeze_items(_items: &[crate::integrity::FrozenItem]) -> Result<()> {
+    anyhow::bail!("config integrity freezing (`run --verify`) is only supported on Linux.")
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
@@ -377,6 +393,67 @@ mod linux {
                 Ok(m) if m.is_dir() => mount_tmpfs(path)?,
                 Ok(m) if m.is_file() => bind_file(&empty, path)?,
                 _ => continue, // missing, dangling, or special — nothing to hide
+            }
+        }
+        Ok(())
+    }
+
+    /// Freeze verified config/trust content into the current namespace. Files
+    /// are bound from a private tmpfs holding the exact verified bytes; tracked
+    /// directories are re-materialized in a fresh tmpfs over the path; paths that
+    /// should be absent are neutralized (emptied) if they reappeared. Reuses the
+    /// same scratch-tmpfs + bind primitives as `mask_paths`.
+    pub fn freeze_items(items: &[crate::integrity::FrozenItem]) -> Result<()> {
+        use crate::integrity::FrozenItem;
+        if items.is_empty() {
+            return Ok(());
+        }
+        // One private tmpfs holds the verified file bytes we bind from, plus a
+        // reusable empty file for neutralizing reappeared "absent" files.
+        let scratch = scratch_dir("freeze")?;
+        mount_tmpfs(&scratch)?;
+        let empty = scratch.join("empty");
+        std::fs::write(&empty, b"")
+            .with_context(|| format!("failed to create {}", empty.display()))?;
+
+        let mut n: usize = 0;
+        for item in items {
+            match item {
+                FrozenItem::File { path, bytes } => {
+                    // Stage the verified bytes on the private tmpfs, then bind
+                    // them over the path (mount resolves a symlinked path to its
+                    // target). The program now reads exactly what we verified.
+                    let staged = scratch.join(format!("f{n}"));
+                    n += 1;
+                    std::fs::write(&staged, bytes.as_slice())
+                        .with_context(|| format!("failed to stage {}", staged.display()))?;
+                    bind_file(&staged, path)?;
+                }
+                FrozenItem::Dir { path, files } => {
+                    // Empty the directory in RAM, then write the verified tree
+                    // back into it. Host writes to the real dir are shadowed.
+                    mount_tmpfs(path)?;
+                    for (rel, bytes) in files {
+                        let dst = path.join(rel);
+                        if let Some(parent) = dst.parent() {
+                            std::fs::create_dir_all(parent).with_context(|| {
+                                format!("failed to create {}", parent.display())
+                            })?;
+                        }
+                        std::fs::write(&dst, bytes.as_slice())
+                            .with_context(|| format!("failed to write {}", dst.display()))?;
+                    }
+                }
+                FrozenItem::Absent { path } => {
+                    // The blessed state had nothing here. If an attacker created
+                    // something, neutralize it (empty dir / empty file) so the
+                    // tool falls back to defaults; otherwise nothing to do.
+                    match std::fs::metadata(path) {
+                        Ok(m) if m.is_dir() => mount_tmpfs(path)?,
+                        Ok(m) if m.is_file() => bind_file(&empty, path)?,
+                        _ => {}
+                    }
+                }
             }
         }
         Ok(())

@@ -56,6 +56,11 @@ dirs = "5"
 # Archive a directory tree to/from bytes for directory vaults (pure Rust)
 tar = "0.4"
 
+# Content hashing for the config-integrity baseline (`run --verify`). BLAKE3 is
+# not Merkle–Damgård (no length-extension) and `Hash::to_hex()` gives the hex
+# string we store, so no separate hex crate is needed.
+blake3 = "1"
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

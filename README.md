@@ -287,6 +287,11 @@ envvault run work -- bash -lc 'echo $OPENAI_API_KEY'
 # (Linux): ~/.aws, ~/.gnupg, … are structurally hidden; ~/.ssh stays visible
 envvault run work --allow ~/.ssh -- claude
 
+# Verify your config/trust files (~/.gitconfig, ~/.npmrc, ~/.pki, …) against a
+# root-owned baseline and freeze the verified copy into the session (Linux):
+sudo envvault baseline set                   # bless current state (once / after edits)
+envvault run work --verify -- claude         # fail closed if any tracked file was tampered
+
 # Add or update secrets — prompts (no echo) for each value (so it never appears
 # on the command line, in shell history, or in /proc/<pid>/cmdline), then wipes
 # the clipboard after each value, since secrets are pasted rather than typed
@@ -313,8 +318,10 @@ envvault unrun --hide ~/.config/some-tool -- ./suspicious-script
 | `edit <name>`            | Open the interactive TUI to manage secrets. |
 | `passwd <name>`          | Change the vault's password (verifies the old one, re-encrypts under the new). |
 | `upgrade <name>`         | Re-encrypt under the current Argon2id parameters (no-op if already current). |
-| `run <name> -- <cmd>…`   | Decrypt in memory and run `<cmd>` with the secrets in its environment. `--harden` keeps them off `/proc`; `--sandbox`/`--allow <path>` hide your credential files for the session (Linux). |
+| `run <name> -- <cmd>…`   | Decrypt in memory and run `<cmd>` with the secrets in its environment. `--harden` keeps them off `/proc`; `--sandbox`/`--allow <path>` hide your credential files for the session; `--verify` checks your config/trust files against the baseline and freezes them (Linux). |
 | `unrun -- <cmd>…`        | Run `<cmd>` with your credential files **hidden** from it (Linux). `--hide <path>` adds more. |
+| `baseline set`           | Record BLAKE3 hashes of your trust/config files into the root-owned baseline (**root**; `--add <path>`, `--user <login>`). |
+| `baseline check` / `show`| Report any drift from the baseline / print it. |
 | `set <name> KEY …`       | Add/update keys; each value entered at a no-echo prompt, then the clipboard is wiped. |
 | `rename <old> <new>`     | Rename a vault. |
 | `rm <name> KEY …`        | Remove one or more keys. |
@@ -621,6 +628,60 @@ and any other tokens there. Allow the narrowest path that works (a single file i
 the tool reads only one), and remember that whatever you allow is visible to the
 program *and* to any code it runs.
 
+### `run --verify`: detect (and freeze out) tampering with trust/config files
+
+Masking hides *secret* files. But there's a second class of file a same-uid
+attacker can abuse without touching the environment: the **config/trust files a
+tool reads directly** — `~/.gitconfig` (`http.sslCAInfo`, `http.proxy`),
+`~/.curlrc`, `~/.npmrc` (`cafile`), `~/.netrc`, `~/.config/pip/pip.conf`, or a
+planted CA in `~/.pki/nssdb`. None of these need an env var, and any of them can
+be planted *before* envvault even starts — redirecting the tool to an attacker's
+CA or proxy. You can't mask these (the tool needs them), and you can't env-scrub
+your way out (they're files, read directly).
+
+`run --verify` checks them against a **root-owned baseline** a same-uid attacker
+can't forge, and freezes the verified copy into the session:
+
+```sh
+# One-time (and after any intended change): bless the current state. Needs root,
+# because the baseline lives at /etc/envvault/<user>.baseline — out of same-uid
+# write reach. That root-ownership is the entire trust anchor.
+sudo envvault baseline set                 # tracks the built-in trust set
+sudo envvault baseline set --add ~/.config/foo/tls.conf   # plus your own paths
+
+envvault baseline check                    # dry run: report any drift, no launch
+envvault baseline show                     # print the stored baseline
+
+# At launch: re-hash each tracked path, FAIL CLOSED on any mismatch, and freeze
+# the verified bytes into the session so they can't change underneath the tool.
+envvault run work --verify -- claude
+envvault run work --sandbox --verify -- claude   # compose: mask secrets + verify config
+```
+
+How it holds: the **BLAKE3 hash anchors integrity** (was the file clean when we
+started?) and the **mount namespace anchors time** (after the check, the verified
+bytes are bound over the path in a private tmpfs — a same-uid attacker writing the
+real file from outside writes *under* the mount and is shadowed for the whole
+session). Either alone has a hole; together they close both the
+already-poisoned-at-start case and the swap-after-check (TOCTOU) case. Tracked
+directories (`~/.pki`) are verified for content **and completeness** — an added or
+removed file is a mismatch, not just an edit. A path that was *absent* when blessed
+is reproduced as absent (if an attacker created one, it's neutralized to empty, so
+the tool falls back to system defaults).
+
+**What it does and doesn't do.** This *shrinks attack surface and detects
+poisoning* — it does **not** "prevent MITM." The robust prevention for the
+key-theft-over-TLS threat lives in the client (certificate pinning, or
+challenge-response auth where nothing replayable goes on the wire), not in the
+launcher. Honest limits: only *tracked* paths are protected (you can never
+enumerate every config file every tool reads); `baseline set` blesses whatever is
+on disk at that instant, so establish it from known-good state; tracked paths are
+followed through symlinks and it's the *content* that's verified/frozen, so
+repointing a tracked symlink *after* the check is a residual; and it only governs
+what `run` launches — anything that already ran outside the vault is already
+compromised. Root is trusted (it owns the anchor); a root attacker is out of scope,
+same as everywhere else here. Linux-only (it needs the namespace freeze).
+
 ## Security notes & limitations
 
 - **Your password is the whole game.** Argon2id makes brute force costly, but a
@@ -644,6 +705,14 @@ program *and* to any code it runs.
   - For tools that read a secret from a *file*, prefer `dir run` (optionally
     `dir run --harden` to also make the consumer non-dumpable) — see
     [`run` vs `dir run`](#run-vs-dir-run-keeping-secrets-off-the-environment).
+- **A same-uid attacker can also poison config/trust files** a tool reads
+  directly (a CA in `~/.gitconfig`/`~/.pki`, a proxy in `~/.curlrc`) without ever
+  touching the environment. `run --verify` detects this against a root-owned
+  baseline and freezes the verified copy into the session — it shrinks surface
+  and detects poisoning, but does **not** "prevent MITM" (that's a client-side
+  concern: cert pinning / challenge-response). Only *tracked* paths are covered,
+  the baseline blesses on-disk state at `set` time, and it governs only what `run`
+  launches. See [`run --verify`](#run---verify-detect-and-freeze-out-tampering-with-trustconfig-files).
 - `envvault` protects secrets *at rest* and limits their *exposure at runtime*.
   Marking the process non-dumpable stops a *same-user* attacker from core-dumping
   or debugging **the `envvault` process** to read its memory, but it does not make
