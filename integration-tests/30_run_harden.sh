@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-# `run --harden`: the program still gets the secret (delivered over a pipe after
-# it is non-dumpable), but a same-uid attacker can no longer read it from
-# /proc/<pid>/environ, and the process is non-dumpable. A static binary (no
-# LD_PRELOAD) fails closed — no secret is sent.
+# `--harden` in BOTH modes:
+#  * env `run --harden`: the program still gets the secret (delivered over a pipe
+#    after it is non-dumpable), but a same-uid attacker can't read it from
+#    /proc/<pid>/environ or /proc/<pid>/mem; a static binary fails closed.
+#  * `dir run --harden`: the consumer (reading its secret from the in-RAM file)
+#    is marked non-dumpable. From the host this is indistinguishable with/without
+#    --harden (the user namespace already blocks a host attacker), so we verify
+#    the shim's effect directly via the consumer's own PR_GET_DUMPABLE.
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
-feature "run --harden"
+feature "run/dir run --harden"
 new_work
 
 echo "$PW" | "$BIN" init work --password-stdin --no-edit >/dev/null
@@ -54,4 +58,35 @@ if [ -n "$CC" ]; then
     fi
 else
     skip "static binary fails closed" "no C compiler found"
+fi
+
+# Direct dumpability probe for BOTH modes: a tiny program that prints its own
+# PR_GET_DUMPABLE. Under --harden the shim marks it non-dumpable (0); plain runs
+# leave it dumpable (1). This is the only reliable way to check `dir run --harden`
+# (host /proc reads are blocked by the namespace either way).
+if [ -n "$CC" ]; then
+    cat > "$WORK/dumpable.c" <<'CSRC'
+#include <stdio.h>
+#include <sys/prctl.h>
+int main(void) { printf("dumpable=%d\n", prctl(PR_GET_DUMPABLE)); return 0; }
+CSRC
+    if "$CC" -O2 -o "$WORK/dumpable" "$WORK/dumpable.c" 2>/dev/null; then
+        # env mode
+        assert_contains "env run --harden: consumer non-dumpable (PR_GET_DUMPABLE=0)" \
+            "$(echo "$PW" | "$BIN" run work --password-stdin --quiet --harden -- "$WORK/dumpable" 2>/dev/null)" "dumpable=0"
+        assert_contains "env run (plain): consumer dumpable (=1)" \
+            "$(echo "$PW" | "$BIN" run work --password-stdin --quiet -- "$WORK/dumpable" 2>/dev/null)" "dumpable=1"
+        # dir mode: vault a throwaway file (in its own dir so the tmpfs-over-parent
+        # doesn't shadow the probe binary), then run the probe as the consumer.
+        mkdir -p "$WORK/seeddir"; printf 'x\n' > "$WORK/seeddir/seed.txt"
+        echo "$PW" | "$BIN" dir init hv --path "$WORK/seeddir/seed.txt" --yes --password-stdin >/dev/null 2>&1
+        assert_contains "dir run --harden: consumer non-dumpable (=0)" \
+            "$(echo "$PW" | "$BIN" dir run hv --password-stdin --harden -- "$WORK/dumpable" 2>/dev/null)" "dumpable=0"
+        assert_contains "dir run (plain): consumer dumpable (=1)" \
+            "$(echo "$PW" | "$BIN" dir run hv --password-stdin -- "$WORK/dumpable" 2>/dev/null)" "dumpable=1"
+    else
+        skip "dumpability probe (env + dir)" "could not compile the probe"
+    fi
+else
+    skip "dumpability probe (env + dir)" "no C compiler found"
 fi
