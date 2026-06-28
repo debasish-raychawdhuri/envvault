@@ -192,6 +192,117 @@ impl Baseline {
             absent,
         })
     }
+
+    /// Whether `p` is a top-level tracked path.
+    pub fn tracks(&self, p: &Path) -> bool {
+        self.dirs.iter().any(|d| d.path == p)
+            || self.files.iter().any(|f| f.path == p)
+            || self.absent.iter().any(|a| a == p)
+    }
+
+    /// If `p` lies *inside* a tracked directory root (and isn't that root),
+    /// return the covering root — pinning it separately would be redundant.
+    pub fn covered_by_dir(&self, p: &Path) -> Option<PathBuf> {
+        self.dirs
+            .iter()
+            .map(|d| &d.path)
+            .find(|d| p != d.as_path() && p.starts_with(d))
+            .cloned()
+    }
+
+    /// Remove the top-level entries for `paths` (removing a directory root drops
+    /// its children too). Returns the paths actually removed.
+    fn remove_top_level(&mut self, paths: &[PathBuf]) -> Vec<PathBuf> {
+        let mut removed = Vec::new();
+        for p in paths {
+            let mut hit = false;
+            let n = self.dirs.len();
+            self.dirs.retain(|d| d.path != *p);
+            hit |= self.dirs.len() != n;
+            let n = self.files.len();
+            self.files.retain(|f| f.path != *p);
+            hit |= self.files.len() != n;
+            let n = self.absent.len();
+            self.absent.retain(|a| a != p);
+            hit |= self.absent.len() != n;
+            if hit {
+                removed.push(p.clone());
+            }
+        }
+        removed
+    }
+
+    fn merge(&mut self, other: Baseline) {
+        self.files.extend(other.files);
+        self.dirs.extend(other.dirs);
+        self.absent.extend(other.absent);
+    }
+
+    fn sort(&mut self) {
+        self.files.sort_by(|a, b| a.path.cmp(&b.path));
+        self.dirs.sort_by(|a, b| a.path.cmp(&b.path));
+        self.absent.sort();
+    }
+}
+
+/// What a `pin`/`unpin` edit changed, for user-facing messages.
+#[derive(Default)]
+pub struct EditReport {
+    /// Newly tracked paths.
+    pub added: Vec<PathBuf>,
+    /// Already-tracked paths whose hash was refreshed to the current state.
+    pub repinned: Vec<PathBuf>,
+    /// Paths skipped because a tracked directory already covers them: `(path, dir)`.
+    pub skipped_covered: Vec<(PathBuf, PathBuf)>,
+    /// Paths removed from tracking.
+    pub removed: Vec<PathBuf>,
+    /// `unpin` targets that weren't top-level tracked paths.
+    pub not_found: Vec<PathBuf>,
+}
+
+/// Pin `add` into `base`: freshly hash those paths and merge them in, replacing
+/// any existing top-level entry for the *same* path. Other entries keep their
+/// stored hashes — pinning one file does **not** re-bless the rest (use
+/// `baseline set` for a full re-bless). Paths already covered by a tracked
+/// directory are skipped.
+pub fn pin(mut base: Baseline, add: &[PathBuf]) -> Result<(Baseline, EditReport)> {
+    let mut rep = EditReport::default();
+    let mut to_compute: Vec<PathBuf> = Vec::new();
+    for p in add {
+        if let Some(dir) = base.covered_by_dir(p) {
+            rep.skipped_covered.push((p.clone(), dir));
+            continue;
+        }
+        if base.tracks(p) {
+            rep.repinned.push(p.clone());
+        } else {
+            rep.added.push(p.clone());
+        }
+        to_compute.push(p.clone());
+    }
+    if !to_compute.is_empty() {
+        let sub = compute(&to_compute)?;
+        base.remove_top_level(&to_compute);
+        base.merge(sub);
+        base.sort();
+    }
+    Ok((base, rep))
+}
+
+/// Unpin `remove` from `base`: drop the matching top-level entries (a directory
+/// root drops its children). Paths that weren't tracked are reported, not an error.
+pub fn unpin(mut base: Baseline, remove: &[PathBuf]) -> (Baseline, EditReport) {
+    let mut rep = EditReport::default();
+    let removed = base.remove_top_level(remove);
+    for p in remove {
+        if removed.iter().any(|r| r == p) {
+            rep.removed.push(p.clone());
+        } else {
+            rep.not_found.push(p.clone());
+        }
+    }
+    base.sort();
+    (base, rep)
 }
 
 /// BLAKE3 hex of `bytes`.
@@ -550,6 +661,88 @@ mod tests {
         let b2 = Baseline::parse(&text).unwrap();
         assert_eq!(b.len(), b2.len());
         assert!(check(&b2).is_empty(), "reparsed baseline still verifies");
+    }
+
+    #[test]
+    fn pin_adds_without_reblessing_others() {
+        let home = tmp("pin");
+        let a = home.join(".gitconfig");
+        let b = home.join(".curlrc");
+        std::fs::write(&a, b"A1").unwrap();
+        let base = compute(&[a.clone()]).unwrap();
+
+        // Tamper A on disk, THEN pin B. Pin must not re-bless A.
+        std::fs::write(&a, b"A2-tampered").unwrap();
+        std::fs::write(&b, b"B1").unwrap();
+        let (base, rep) = pin(base, &[b.clone()]).unwrap();
+        assert_eq!(rep.added, vec![b.clone()]);
+        assert!(rep.repinned.is_empty());
+
+        // A is now tracked at its OLD hash → still flagged; B verifies clean.
+        let problems = check(&base);
+        assert_eq!(problems.len(), 1, "only A should mismatch: {problems:?}");
+        assert!(problems[0].contains(".gitconfig"));
+        assert!(base.tracks(&b));
+    }
+
+    #[test]
+    fn repin_reblesses_only_that_path() {
+        let home = tmp("repin");
+        let a = home.join(".gitconfig");
+        std::fs::write(&a, b"V1").unwrap();
+        let base = compute(&[a.clone()]).unwrap();
+        std::fs::write(&a, b"V2").unwrap();
+        assert!(!check(&base).is_empty(), "edit should mismatch before re-pin");
+
+        let (base, rep) = pin(base, &[a.clone()]).unwrap();
+        assert_eq!(rep.repinned, vec![a.clone()]);
+        assert!(check(&base).is_empty(), "re-pinning blesses the new content");
+    }
+
+    #[test]
+    fn pin_skips_paths_covered_by_tracked_dir() {
+        let home = tmp("cover");
+        let pki = home.join(".pki");
+        std::fs::create_dir_all(&pki).unwrap();
+        let child = pki.join("cert9.db");
+        std::fs::write(&child, b"c").unwrap();
+        let base = compute(&[pki.clone()]).unwrap();
+
+        let (base, rep) = pin(base, &[child.clone()]).unwrap();
+        assert_eq!(rep.skipped_covered.len(), 1);
+        assert_eq!(rep.skipped_covered[0].1, pki);
+        assert!(!base.tracks(&child), "child stays covered by the dir, not standalone");
+    }
+
+    #[test]
+    fn unpin_removes_and_reports_not_found() {
+        let home = tmp("unpin");
+        let a = home.join(".gitconfig");
+        let b = home.join(".curlrc");
+        std::fs::write(&a, b"a").unwrap();
+        let base = compute(&[a.clone(), b.clone()]).unwrap(); // b is absent
+        assert!(base.tracks(&a) && base.tracks(&b));
+
+        let (base, rep) = unpin(base, &[a.clone(), home.join(".never")]);
+        assert_eq!(rep.removed, vec![a.clone()]);
+        assert_eq!(rep.not_found, vec![home.join(".never")]);
+        assert!(!base.tracks(&a));
+        assert!(base.tracks(&b), "untouched entries remain");
+    }
+
+    #[test]
+    fn unpin_dir_drops_its_children() {
+        let home = tmp("unpindir");
+        let pki = home.join(".pki");
+        std::fs::create_dir_all(&pki).unwrap();
+        std::fs::write(pki.join("a"), b"a").unwrap();
+        std::fs::write(pki.join("b"), b"b").unwrap();
+        let base = compute(&[pki.clone()]).unwrap();
+        assert!(base.len() >= 2);
+
+        let (base, rep) = unpin(base, &[pki.clone()]);
+        assert_eq!(rep.removed, vec![pki.clone()]);
+        assert_eq!(base.len(), 0, "dir and all its children gone");
     }
 
     #[test]

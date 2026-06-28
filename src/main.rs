@@ -175,6 +175,27 @@ enum BaselineCmd {
         #[arg(long)]
         user: Option<String>,
     },
+    /// Add path(s) to the tracked set, hashing them at their current state
+    /// (root). Re-pinning an already-tracked path re-blesses just that path;
+    /// other entries are left untouched.
+    Pin {
+        /// Path(s) to start tracking.
+        #[arg(required = true, num_args = 1.., value_name = "PATH")]
+        paths: Vec<String>,
+        /// User whose baseline to edit (default: $SUDO_USER).
+        #[arg(long)]
+        user: Option<String>,
+    },
+    /// Remove path(s) from the tracked set (root). Unpinning a tracked directory
+    /// drops it and everything under it.
+    Unpin {
+        /// Path(s) to stop tracking.
+        #[arg(required = true, num_args = 1.., value_name = "PATH")]
+        paths: Vec<String>,
+        /// User whose baseline to edit (default: $SUDO_USER).
+        #[arg(long)]
+        user: Option<String>,
+    },
     /// Print the stored baseline for a user (default: you).
     Show {
         #[arg(long)]
@@ -324,6 +345,8 @@ fn run_cli() -> Result<()> {
 fn run_baseline(command: BaselineCmd) -> Result<()> {
     match command {
         BaselineCmd::Set { add, user } => cmd_baseline_set(&add, user.as_deref()),
+        BaselineCmd::Pin { paths, user } => cmd_baseline_pin(&paths, user.as_deref()),
+        BaselineCmd::Unpin { paths, user } => cmd_baseline_unpin(&paths, user.as_deref()),
         BaselineCmd::Show { user } => cmd_baseline_show(user.as_deref()),
         BaselineCmd::Check { user } => cmd_baseline_check(user.as_deref()),
     }
@@ -640,14 +663,15 @@ fn expand_under(home: &Path, s: &str) -> std::path::PathBuf {
     }
 }
 
-/// `sudo envvault baseline set` — record BLAKE3 hashes of the target user's
-/// trust/config set into the root-owned baseline. Must run as root.
-fn cmd_baseline_set(add: &[String], user: Option<&str>) -> Result<()> {
+/// Shared preamble for the root-only baseline editors (`set`/`pin`/`unpin`):
+/// require root, resolve the target user (`--user` else `$SUDO_USER`, never
+/// root), and return that user's name and home (from the passwd DB).
+fn baseline_target(user: Option<&str>) -> Result<(String, std::path::PathBuf)> {
     #[cfg(unix)]
     if unsafe { libc::geteuid() } != 0 {
         bail!(
-            "`baseline set` writes the root-owned baseline under {} and must run as root.\n\
-             Try: sudo envvault baseline set",
+            "editing the root-owned baseline under {} must run as root.\n\
+             Try: sudo envvault baseline <set|pin|unpin> …",
             integrity::BASELINE_DIR
         );
     }
@@ -655,7 +679,7 @@ fn cmd_baseline_set(add: &[String], user: Option<&str>) -> Result<()> {
         Some(u) => u.to_string(),
         None => std::env::var("SUDO_USER").map_err(|_| {
             anyhow::anyhow!(
-                "could not determine whose files to baseline; pass --user <login> \
+                "could not determine whose baseline to edit; pass --user <login> \
                  (running directly as root, $SUDO_USER is unset)"
             )
         })?,
@@ -664,6 +688,18 @@ fn cmd_baseline_set(add: &[String], user: Option<&str>) -> Result<()> {
         bail!("refusing to baseline root's home; pass --user <your-login>");
     }
     let home = home_for_user(&target)?;
+    Ok((target, home))
+}
+
+/// Pluralize "entr{y,ies}" for counts.
+fn entries(n: usize) -> &'static str {
+    if n == 1 { "y" } else { "ies" }
+}
+
+/// `sudo envvault baseline set` — record BLAKE3 hashes of the target user's
+/// trust/config set into the root-owned baseline (full re-bless). Must run as root.
+fn cmd_baseline_set(add: &[String], user: Option<&str>) -> Result<()> {
+    let (target, home) = baseline_target(user)?;
     let mut tracked: Vec<std::path::PathBuf> = integrity::TRUST_CONFIG_PATHS
         .iter()
         .map(|rel| home.join(rel))
@@ -677,7 +713,61 @@ fn cmd_baseline_set(add: &[String], user: Option<&str>) -> Result<()> {
         "Wrote integrity baseline for user '{target}' to {} ({} tracked entr{}).",
         integrity::baseline_path(&target).display(),
         baseline.len(),
-        if baseline.len() == 1 { "y" } else { "ies" }
+        entries(baseline.len())
+    );
+    Ok(())
+}
+
+/// `sudo envvault baseline pin <path>…` — add path(s) to the tracked set without
+/// re-blessing the rest. Surgical: only the named paths are (re)hashed.
+fn cmd_baseline_pin(paths: &[String], user: Option<&str>) -> Result<()> {
+    let (target, home) = baseline_target(user)?;
+    let baseline = integrity::read(&target)?;
+    let add: Vec<std::path::PathBuf> = paths.iter().map(|s| expand_under(&home, s)).collect();
+    let (baseline, rep) = integrity::pin(baseline, &add)?;
+    for (p, dir) in &rep.skipped_covered {
+        eprintln!(
+            "note: {} is already covered by tracked directory {} — skipped",
+            p.display(),
+            dir.display()
+        );
+    }
+    if rep.added.is_empty() && rep.repinned.is_empty() {
+        bail!("nothing to pin (every path given was already covered by a tracked directory)");
+    }
+    integrity::write(&target, &baseline)?;
+    println!(
+        "Pinned for '{target}': {} added, {} re-blessed — {} tracked entr{} total.",
+        rep.added.len(),
+        rep.repinned.len(),
+        baseline.len(),
+        entries(baseline.len())
+    );
+    Ok(())
+}
+
+/// `sudo envvault baseline unpin <path>…` — remove path(s) from the tracked set.
+fn cmd_baseline_unpin(paths: &[String], user: Option<&str>) -> Result<()> {
+    let (target, home) = baseline_target(user)?;
+    let baseline = integrity::read(&target)?;
+    let remove: Vec<std::path::PathBuf> = paths.iter().map(|s| expand_under(&home, s)).collect();
+    let (baseline, rep) = integrity::unpin(baseline, &remove);
+    for p in &rep.not_found {
+        eprintln!(
+            "note: {} was not a top-level tracked path — skipped (a file inside a \
+             tracked directory can only be removed by unpinning that directory)",
+            p.display()
+        );
+    }
+    if rep.removed.is_empty() {
+        bail!("nothing removed — none of the given paths were tracked");
+    }
+    integrity::write(&target, &baseline)?;
+    println!(
+        "Unpinned for '{target}': {} removed — {} tracked entr{} remain.",
+        rep.removed.len(),
+        baseline.len(),
+        entries(baseline.len())
     );
     Ok(())
 }

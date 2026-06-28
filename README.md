@@ -321,6 +321,8 @@ envvault unrun --hide ~/.config/some-tool -- ./suspicious-script
 | `run <name> -- <cmd>…`   | Decrypt in memory and run `<cmd>` with the secrets in its environment. `--harden` keeps them off `/proc`; `--sandbox`/`--allow <path>` hide your credential files for the session; `--verify` checks your config/trust files against the baseline and freezes them (Linux). |
 | `unrun -- <cmd>…`        | Run `<cmd>` with your credential files **hidden** from it (Linux). `--hide <path>` adds more. |
 | `baseline set`           | Record BLAKE3 hashes of your trust/config files into the root-owned baseline (**root**; `--add <path>`, `--user <login>`). |
+| `baseline pin <path>…`   | Add path(s) to the tracked set without re-blessing the rest (**root**). Re-pinning a tracked path re-blesses just it. |
+| `baseline unpin <path>…` | Remove path(s) from the tracked set (**root**); unpinning a directory drops everything under it. |
 | `baseline check` / `show`| Report any drift from the baseline / print it. |
 | `set <name> KEY …`       | Add/update keys; each value entered at a no-echo prompt, then the clipboard is wiped. |
 | `rename <old> <new>`     | Rename a vault. |
@@ -648,6 +650,13 @@ can't forge, and freezes the verified copy into the session:
 # write reach. That root-ownership is the entire trust anchor.
 sudo envvault baseline set                 # tracks the built-in trust set
 sudo envvault baseline set --add ~/.config/foo/tls.conf   # plus your own paths
+
+# Adjust the tracked set later — also root, since it edits the same root-owned
+# file. `pin`/`unpin` are surgical: pinning one path does NOT re-bless the rest
+# (that's what `set` is for), and unpinning a directory drops everything under it.
+sudo envvault baseline pin ~/.config/foo/tls.conf   # start tracking a path
+sudo envvault baseline pin ~/.gitconfig             # re-pin to re-bless just it
+sudo envvault baseline unpin ~/.wgetrc              # stop tracking a path
 
 envvault baseline check                    # dry run: report any drift, no launch
 envvault baseline show                     # print the stored baseline
