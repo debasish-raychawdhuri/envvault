@@ -691,6 +691,84 @@ what `run` launches — anything that already ran outside the vault is already
 compromised. Root is trusted (it owns the anchor); a root attacker is out of scope,
 same as everywhere else here. Linux-only (it needs the namespace freeze).
 
+## Maximum security: putting it all together
+
+The hardening features are independent and compose. For the strongest posture,
+combine them — there are two recipes, depending on how your program reads the
+secret.
+
+### One-time setup
+
+```sh
+# Create the vault and add your secrets (interactive editor)…
+envvault init work
+# …or add keys from the command line (each value entered at a no-echo prompt,
+# so it never lands in argv or shell history):
+envvault set work OPENAI_API_KEY ANTHROPIC_API_KEY
+
+# Establish the root-owned config-integrity baseline — the trust anchor a
+# same-uid attacker can't forge. Needs sudo. Re-run only after you *intend* to
+# change a tracked config/trust file (then: sudo envvault baseline set, or
+# `baseline pin <path>`).
+sudo envvault baseline set
+```
+
+### A) Program that reads the secret from an environment variable
+
+```sh
+envvault run work --harden --sandbox --verify --allow ~/.ssh -- claude
+```
+
+Each flag closes a distinct hole:
+
+- **`--harden`** — the secret never enters the initial environment; a preloaded
+  shim marks the program non-dumpable and hands it the secret over a pipe, so a
+  same-uid attacker can read neither `/proc/<pid>/environ` nor `/proc/<pid>/mem`.
+  Fails closed on a static or setuid binary (no secret is sent).
+- **`--sandbox`** — every credential file (`~/.ssh`, `~/.aws`, `~/.gnupg`, …) is
+  structurally masked for the whole session *and everything it spawns*; nothing
+  nested can undo it.
+- **`--allow ~/.ssh`** — leave visible only the one credential path the program
+  legitimately needs (here, so it can still `git push`). Drop `--allow` entirely
+  to hide all of them; repeat it for more than one.
+- **`--verify`** — your trust/config files (`~/.gitconfig`, `~/.npmrc`, `~/.pki`,
+  …) are checked against the root-owned baseline and the verified copy is frozen
+  into the session. If any was tampered with, the run **aborts before the program
+  starts**.
+
+### B) Program that reads the secret from a file (config dir / token file)
+
+For tools like Claude Code or opencode that keep their key in a config directory
+or file, vault the path and decrypt it into RAM only while the tool runs:
+
+```sh
+envvault dir init claude --path ~/.claude     # one-time: encrypt the dir, then empty it
+envvault dir run claude --harden -- claude     # decrypt into tmpfs, run, re-encrypt on exit
+```
+
+- The decrypted contents live **only in a private, in-RAM tmpfs** at the original
+  path, visible to this process tree alone — never on the host filesystem and not
+  to another same-uid process (a private user namespace blocks cross-namespace
+  `ptrace`/`/proc/<pid>/mem`).
+- **`--harden`** marks the consumer non-dumpable, so code *it* spawns in the same
+  namespace can't core-dump or `ptrace` it to scrape the secret from memory.
+- On exit the directory is re-encrypted; a `SIGKILL`/power loss costs at most the
+  changes since the last autosave.
+
+### What "maximum" does and doesn't buy you
+
+- **Closes:** at-rest exposure; `/proc/<pid>/environ` and `/proc/<pid>/mem` reads
+  by a same-uid attacker; credential-file harvesting by untested code; and
+  same-uid poisoning of trust/config files.
+- **Does NOT close:** a **root** attacker (out of scope — root reads any process's
+  memory and any file); an attacker who keylogs you or replaces the `envvault`
+  binary; or network theft of the key once a program puts it on the wire. The
+  robust answer to that last one lives in the *client* (certificate pinning, or
+  challenge-response auth where nothing replayable is sent) — not in a launcher.
+- **Platform:** the namespace-based parts (`--sandbox`, `--verify`, `dir run`) are
+  **Linux-only** and need unprivileged user namespaces. On macOS, only at-rest
+  encryption applies.
+
 ## Security notes & limitations
 
 - **Your password is the whole game.** Argon2id makes brute force costly, but a
