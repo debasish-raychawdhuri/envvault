@@ -394,6 +394,20 @@ fn run_dir(command: DirCmd) -> Result<()> {
     }
 }
 
+/// Open a handle to the system clipboard so a pasted secret can be wiped after
+/// use — unless `ENVVAULT_NO_CLIPBOARD` is set, in which case clipboard
+/// integration is skipped entirely. Set that in headless/SSH/CI/automation
+/// environments: some clipboard backends block indefinitely on connect when a
+/// display socket is half-present, which would otherwise hang `set` and the
+/// editor. Returns `None` when disabled or unreachable (callers treat that as
+/// "can't wipe — say so").
+pub(crate) fn open_clipboard() -> Option<arboard::Clipboard> {
+    if std::env::var_os("ENVVAULT_NO_CLIPBOARD").is_some() {
+        return None;
+    }
+    arboard::Clipboard::new().ok()
+}
+
 /// Acquire a password for opening an existing vault.
 fn get_password(password_stdin: bool) -> Result<Zeroizing<String>> {
     if password_stdin {
@@ -1192,8 +1206,8 @@ fn cmd_set(name: &str, keys: &[String]) -> Result<()> {
     // Secret values are pasted, not typed, so wipe the system clipboard after
     // each one is entered. The handle is held across the loop so the emptied
     // selection keeps being served on X11; `None` if no clipboard is reachable
-    // (e.g. headless / SSH without a display).
-    let mut clipboard = arboard::Clipboard::new().ok();
+    // (e.g. headless / SSH without a display, or ENVVAULT_NO_CLIPBOARD).
+    let mut clipboard = open_clipboard();
     for key in keys {
         let value = password::prompt_value(key)?;
         vault.set(key, &value);

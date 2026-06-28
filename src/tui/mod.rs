@@ -75,8 +75,9 @@ fn event_loop(terminal: &mut Tui, app: &mut App, session: &Session, path: &std::
     // Held for the whole session so a cleared (empty) clipboard keeps being
     // served on X11, where the setting process must stay alive to serve the
     // selection. `None` if no clipboard is reachable (e.g. headless / SSH
-    // without a display) — pasting still works, we just can't wipe it.
-    let mut clipboard = arboard::Clipboard::new().ok();
+    // without a display, or ENVVAULT_NO_CLIPBOARD) — pasting still works, we
+    // just can't wipe it.
+    let mut clipboard = crate::open_clipboard();
 
     loop {
         terminal.draw(|f| draw(f, app))?;
